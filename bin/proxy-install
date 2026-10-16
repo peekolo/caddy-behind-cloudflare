@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# proxy-install <host> [--dry-run]: install or update the shared Caddy in /srv/proxy on a host, from this repo's proxy/.
+# Runs on the workstation, connects as the deploy user. Idempotent. Never touches project-owned files:
+# conf/sites/*.caddy, certs/*, .env (created once from .env.example with the box's deploy gid).
+source "$(dirname "$0")/../lib/common.sh"
+need ssh rsync
+H=${1:-}; [[ -n "$H" && "$H" != -* ]] || die "usage: bin/proxy-install <host> [--dry-run]"
+[[ "${2:-}" == --dry-run ]] && DRY_RUN=1
+load_host "$H"
+
+step "1. reach $HOST_SSH as deploy"
+on_host 'id -nG' | grep -qw docker || die "deploy on $HOST_NAME is not in the docker group (run bin/host-bootstrap.sh)"
+on_host "test -d $PROXY_DIR -a -w $PROXY_DIR" || die "$PROXY_DIR missing or not writable (run bin/host-bootstrap.sh)"
+ok "deploy@$HOST_NAME, $PROXY_DIR writable"
+
+step "2. network $PROXY_NET ($PROXY_SUBNET)"
+have=$(on_host "docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' $PROXY_NET 2>/dev/null" || true)
+if [[ "$have" == "$PROXY_SUBNET" ]]; then ok "exists"
+elif [[ -n "$have" ]]; then die "network $PROXY_NET exists with subnet $have, expected $PROXY_SUBNET"
+elif act "docker network create --subnet $PROXY_SUBNET $PROXY_NET"; then on_host "docker network create --subnet $PROXY_SUBNET $PROXY_NET" >/dev/null; ok created
+fi
+
+step "3. proxy files"
+RS=(rsync -rlt --checksum --itemize-changes --chmod=Dg+ws,Fg+w --exclude .env --exclude 'certs/*.pem' --exclude 'certs/*.key'
+    --exclude 'certs/*.csr' --exclude 'conf/sites/*.caddy' --exclude .gitignore)
+changes=$("${RS[@]}" --dry-run "$AIDEPLOY/proxy/" "$HOST_SSH:$PROXY_DIR/" | grep -v '^\.' || true)
+if [[ -z "$changes" ]]; then ok "already current"
+else
+  printf '%s\n' "$changes" | sed 's/^/       /'
+  if act "rsync proxy/ -> $PROXY_DIR"; then "${RS[@]}" "$AIDEPLOY/proxy/" "$HOST_SSH:$PROXY_DIR/" >/dev/null; ok synced; fi
+fi
+if on_host "test -f $PROXY_DIR/.env"; then ok ".env kept"
+elif act "create .env (DEPLOY_GID from the box)"; then
+  on_host "cd $PROXY_DIR && sed \"s/^DEPLOY_GID=.*/DEPLOY_GID=\$(id -g)/\" .env.example > .env && chmod 640 .env"; ok ".env created"
+fi
+
+step "4. start / update caddy"
+if act "docker compose up -d --wait"; then
+  on_host "cd $PROXY_DIR && docker compose up -d --wait 2>&1 | tail -2 && ./reload.sh 2>&1 | grep -vE '\"level\":\"(info|warn)\"'"
+fi
+on_host "docker ps --format '{{.Names}}\t{{.Status}}\t{{.Ports}}'" | awk -F'\t' '$3 ~ /0\.0\.0\.0|:::|\[::\]/ {print "       publishes host ports: " $1 " (" $2 ")"}'
+echo; echo "Next: bin/site-add for each project (see CLAUDE.md, 'Add a project')."

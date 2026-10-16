@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# site-remove: take one project's site off a host's shared Caddy, and optionally its DNS records.
+#   bin/site-remove --host myhost --project shop [--zone example.com --names "@ www"] [--dry-run]
+# The site file is kept in /srv/proxy/sites-backup/. DNS records are deleted only when --zone and --names are given
+# and only if they point at this host. The zone's certificate and settings stay (other names may use them).
+source "$(dirname "$0")/../lib/common.sh"
+need ssh curl jq
+HOSTN= PROJECT= ZONE= NAMES=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host) HOSTN=$2; shift 2 ;; --project) PROJECT=$2; shift 2 ;; --zone) ZONE=$2; shift 2 ;;
+    --names) NAMES=$2; shift 2 ;; --dry-run) DRY_RUN=1; shift ;; -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
+    *) die "unknown option $1" ;;
+  esac
+done
+[[ -n "$HOSTN" && -n "$PROJECT" ]] || die "--host and --project are required"
+load_host "$HOSTN"
+dest=$PROXY_DIR/conf/sites/$PROJECT.caddy
+step "site $dest"
+if ! on_host "test -f $dest"; then skip "not installed"
+elif act "move it to sites-backup/ and reload"; then
+  on_host "mkdir -p $PROXY_DIR/sites-backup && mv $dest $PROXY_DIR/sites-backup/$PROJECT.caddy.removed-\$(date -u +%Y%m%dT%H%M%SZ) && $PROXY_DIR/reload.sh >/dev/null 2>&1" \
+    || die "reload failed after removing the file (another site file is broken?): check with $PROXY_DIR/reload.sh"
+  ok "removed, proxy reloaded"
+fi
+if [[ -n "$ZONE" && -n "$NAMES" ]]; then
+  step "dns"
+  ZID=$(cf_zone_id "$ZONE")
+  for n in $NAMES; do
+    f=$(fqdn "$ZONE" "$n")
+    ids=$(cf GET "/zones/$ZID/dns_records?name=$f&type=A" | jq -r --arg ip "$HOST_IP" '.result[] | select(.content==$ip) | .id')
+    [[ -z "$ids" ]] && { skip "$f: no A record to $HOST_IP"; continue; }
+    for id in $ids; do act "delete A $f -> $HOST_IP" && cf DELETE "/zones/$ZID/dns_records/$id" >/dev/null && ok "deleted $f"; done
+  done
+fi
+echo

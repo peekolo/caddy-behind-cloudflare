@@ -1,0 +1,81 @@
+# Shared front door for every project on this host. Global options and shared snippets live here; each project
+# owns exactly one site file in sites/ (sites/<project>.caddy) that upstreams to its unique alias on the `proxy`
+# network (sh-web, bl-api, ...), never to a bare service name like `web` or `api`.
+#
+# Every zone is orange cloud (Cloudflare proxy, SSL mode "Full (strict)"). So:
+#  - certificates are Cloudflare Origin CA certs in /certs (import cloudflare_origin <zone>); Caddy requests none,
+#  - the client IP is CF-Connecting-IP, trusted only from Cloudflare's ranges ({$CF_RANGES}, cloudflare.env),
+#  - a connection from anywhere else is dropped (the provider firewall should already have stopped it),
+#  - upstreams get X-Forwarded-For = that one client IP (import forward_client_ip in every reverse_proxy).
+{
+	auto_https disable_certs
+	# The Cloudflare gate (cloudflare_origin) runs before redir, handle, reverse_proxy, everything.
+	order abort first
+	servers {
+		trusted_proxies static {$CF_RANGES}
+		client_ip_headers CF-Connecting-IP
+		protocols h1 h2
+		timeouts {
+			read_header 10s
+			idle 5m
+		}
+	}
+}
+
+# ---- shared snippets (import them from a site file) -------------------------------------------------
+
+# First line of every site block: `import cloudflare_origin <zone>`, e.g. `import cloudflare_origin example.com`.
+# Serves /certs/<zone>.pem + .key (one Origin CA cert per zone, covering <zone> and *.<zone>) and drops any
+# request that did not come through Cloudflare (or the local smoke checks, {$LOCAL_RANGES}).
+(cloudflare_origin) {
+	tls /certs/{args[0]}.pem /certs/{args[0]}.key
+	@not_cloudflare not remote_ip {$CF_RANGES} {$LOCAL_RANGES}
+	abort @not_cloudflare
+}
+
+# Inside every reverse_proxy block. Cloudflare sends X-Forwarded-For "client[, ...]" and Caddy would append the
+# Cloudflare edge address, so an app reading the right-most entry would see Cloudflare. Send exactly one address.
+(forward_client_ip) {
+	header_up X-Forwarded-For {client_ip}
+	header_up X-Real-IP {client_ip}
+}
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(self)"
+		-Server
+	}
+}
+
+# Only HSTS and no Server header, for apps that already set their own security headers (e.g. from their own nginx).
+(hsts_only) {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+}
+
+# Access log to stdout -> journald (14 days at most). `client_ip` in each line is the visitor (CF-Connecting-IP).
+# Query strings are cut (signed URLs carry their signature there). Cookie, Authorization and Set-Cookie values
+# are redacted by Caddy itself.
+(access_log) {
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri regexp \?.* ?redacted
+				request>headers>Cf-Connecting-Ip delete
+				request>headers>X-Forwarded-For delete
+			}
+		}
+	}
+}
+
+# ---- sites: one file per project --------------------------------------------------------------------
+
+import sites/*.caddy

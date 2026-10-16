@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# host-check <host>: read-only status of a host: proxy health, files vs this repo, sites, certificates, host ports,
+# log retention. Changes nothing. Run it before and after any change.
+source "$(dirname "$0")/../lib/common.sh"
+need ssh rsync
+H=${1:-}; [[ -n "$H" ]] || die "usage: bin/host-check <host>"
+load_host "$H"
+step "$HOST_NAME ($HOST_TYPE, $HOST_IP) as $HOST_SSH"
+on_host 'echo "  user $(id -un), groups $(id -nG)"; uptime | sed "s/^/  /"'
+step "proxy"
+on_host "cd $PROXY_DIR 2>/dev/null && docker compose ps --format '  {{.Name}}  {{.Status}}' 2>/dev/null || echo '  not installed'"
+on_host "docker network inspect -f '  network {{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}, members: {{range .Containers}}{{.Name}} {{end}}' $PROXY_NET 2>/dev/null || echo '  no proxy network'"
+drift=$(rsync -rlt --checksum --dry-run --itemize-changes --exclude .env --exclude 'certs/*.pem' --exclude 'certs/*.key' --exclude 'certs/*.csr' \
+  --exclude 'conf/sites/*.caddy' --exclude .gitignore "$AIDEPLOY/proxy/" "$HOST_SSH:$PROXY_DIR/" 2>/dev/null | grep -v '^\.' || true)
+[[ -z "$drift" ]] && ok "proxy files match this repo's proxy/" || { warn "proxy files differ from this repo's proxy/ (bin/proxy-install $H):"; printf '%s\n' "$drift" | sed 's/^/       /'; }
+step "sites and certificates"
+on_host "cd $PROXY_DIR 2>/dev/null || exit 0; for s in conf/sites/*.caddy; do [ -f \"\$s\" ] || continue; echo \"  site \$(basename \$s): \$(grep -oE '^[a-z0-9.*-]+\.[a-z]+' \$s | tr '\n' ' ')\"; done
+  for c in certs/*.pem; do [ -f \"\$c\" ] || continue; echo \"  cert \$(basename \$c .pem): \$(openssl x509 -in \$c -enddate -noout | cut -d= -f2)\"; done
+  ls certs/*.key >/dev/null 2>&1 && for k in certs/*.key; do z=\$(basename \$k .key); [ -f certs/\$z.pem ] || echo \"  key without cert: \$z\"; done; true"
+step "host"
+on_host "docker ps --format '{{.Names}}\t{{.Ports}}' | awk -F'\t' '\$2 ~ /0\.0\.0\.0|\[::\]/ {print \"  publishes host ports: \" \$1}'"
+on_host "echo \"  journald MaxRetentionSec: \$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -E '^MaxRetentionSec' | tail -1 | cut -d= -f2)\"; free -m | awk '/Mem:/ {print \"  memory: \" \$3 \" MB used of \" \$2}'; df -h / | awk 'NR==2 {print \"  disk /: \" \$3 \" used of \" \$2}'"
+for p in 80 443; do timeout 6 bash -c "</dev/tcp/$HOST_IP/$p" 2>/dev/null && warn "port $p reachable from this machine (should be Cloudflare only)" || ok "port $p closed to this machine"; done

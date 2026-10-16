@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# site-add: put one project's domain behind Cloudflare and the host's shared Caddy, in a fixed order that never
+# sends visitors to a site that cannot answer. Runs on the workstation. Idempotent: re-run it any time; every step
+# checks first and only changes what differs.
+#
+#   bin/site-add --host myhost --zone example.com --project shop \
+#                --site-file ~/code/shop/deploy/proxy-site.caddy --names "@ www"
+#
+# Steps (default all; pick with --only cert,settings,site,dns,verify):
+#   cert      key + CSR made ON the box (the key never leaves it), Cloudflare Origin CA certificate (15 years,
+#             <zone> + *.<zone>) via the API, saved as /srv/proxy/certs/<zone>.pem; renewed when < 30 days left
+#   settings  zone: SSL Full (strict), Always Use HTTPS, minimum TLS 1.2, Rocket Loader off; --bot-fight off|on
+#   site      copies --site-file to /srv/proxy/conf/sites/<project>.caddy, validates + reloads; restores on failure
+#   dns       A <name> -> host IP, proxied (orange), for each of --names; conflicting AAAA/CNAME: --replace
+#   verify    each name answers through Cloudflare (no 52x), and the origin refuses a direct connection
+#
+# Options: --dry-run (show, change nothing), --force-zone (allow zone-wide settings when the zone also has proxied
+# records pointing at other servers), --replace (delete conflicting AAAA/CNAME records for --names).
+source "$(dirname "$0")/../lib/common.sh"
+need ssh scp curl jq openssl dig
+
+HOSTN= ZONE= PROJECT= SITE_FILE= NAMES="@ www" ONLY="cert,settings,site,dns,verify" BOT=leave FORCE_ZONE=0 REPLACE=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host) HOSTN=$2; shift 2 ;;      --zone) ZONE=$2; shift 2 ;;
+    --project) PROJECT=$2; shift 2 ;; --site-file) SITE_FILE=$2; shift 2 ;;
+    --names) NAMES=$2; shift 2 ;;     --only) ONLY=$2; shift 2 ;;
+    --bot-fight) BOT=$2; shift 2 ;;   --force-zone) FORCE_ZONE=1; shift ;;
+    --replace) REPLACE=1; shift ;;    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    *) die "unknown option $1 (see --help)" ;;
+  esac
+done
+[[ -n "$HOSTN" && -n "$ZONE" ]] || die "--host and --zone are required (see --help)"
+want() { [[ ",$ONLY," == *",$1,"* ]]; }
+if want site; then
+  [[ -n "$PROJECT" && -n "$SITE_FILE" ]] || die "step site needs --project and --site-file (or leave it out of --only)"
+  [[ "$PROJECT" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "--project must be lowercase letters, digits, dashes"
+  [[ -f "$SITE_FILE" ]] || die "no site file $SITE_FILE"
+fi
+load_host "$HOSTN"
+[[ "$DRY_RUN" == 1 ]] && warn "dry run: nothing will change"
+
+step "preflight"
+[[ "$(cf GET /user/tokens/verify | jq -r .result.status)" == active ]] || die "Cloudflare token is not active"
+ZID=$(cf_zone_id "$ZONE"); ok "zone $ZONE ($ZID)"
+on_host "docker inspect -f '{{.State.Health.Status}}' proxy-caddy-1" 2>/dev/null | grep -qx healthy \
+  || die "proxy-caddy-1 is not healthy on $HOST_NAME (run bin/proxy-install $HOSTN)"
+ok "proxy healthy on $HOST_NAME ($HOST_IP)"
+CERT=$PROXY_DIR/certs/$ZONE
+
+# ---------------------------------------------------------------------------------------------------------------
+if want cert; then
+  step "cert: Origin CA certificate for $ZONE, *.$ZONE"
+  state=$(on_host "cd $PROXY_DIR/certs && if [ -f $ZONE.pem ] && [ -f $ZONE.key ]; then
+      a=\$(openssl pkey -in $ZONE.key -pubout 2>/dev/null); b=\$(openssl x509 -in $ZONE.pem -pubkey -noout 2>/dev/null)
+      if [ \"\$a\" != \"\$b\" ]; then echo mismatch; elif openssl x509 -in $ZONE.pem -checkend 2592000 -noout >/dev/null; then echo valid; else echo expiring; fi
+    elif [ -f $ZONE.key ]; then echo key-only; else echo none; fi")
+  case "$state" in
+    valid) ok "$CERT.pem present, matches its key, > 30 days left: $(on_host "openssl x509 -in $CERT.pem -enddate -noout")" ;;
+    mismatch) die "$CERT.pem does not match $CERT.key: move both aside by hand and re-run" ;;
+    *)
+      [[ "$state" == none ]] && if act "make key + CSR on the box ($CERT.key, ECDSA P-256)"; then
+        on_host "cd $PROXY_DIR/certs && umask 027 && openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+          -keyout $ZONE.key -out $ZONE.csr -subj /CN=$ZONE -addext subjectAltName=DNS:$ZONE,DNS:*.$ZONE 2>/dev/null && chmod 640 $ZONE.key && chmod 644 $ZONE.csr"
+      fi
+      if act "request Origin CA certificate ($state) and save $CERT.pem"; then
+        on_host "test -f $CERT.csr" || on_host "cd $PROXY_DIR/certs && openssl req -new -key $ZONE.key -out $ZONE.csr -subj /CN=$ZONE -addext subjectAltName=DNS:$ZONE,DNS:*.$ZONE"
+        csr=$(on_host "cat $CERT.csr")
+        body=$(jq -n --arg csr "$csr" --arg z "$ZONE" '{csr:$csr, hostnames:[$z, "*."+$z], request_type:"origin-ecc", requested_validity:5475}')
+        res=$(cf POST /certificates "$body")
+        jq -r .result.certificate <<<"$res" | on_host "cat > $CERT.pem.new && chmod 644 $CERT.pem.new && \
+          [ \"\$(openssl pkey -in $CERT.key -pubout)\" = \"\$(openssl x509 -in $CERT.pem.new -pubkey -noout)\" ] && mv $CERT.pem.new $CERT.pem" \
+          || die "the issued certificate does not match the key (left as $CERT.pem.new)"
+        ok "issued $(jq -r '.result.id + ", expires " + .result.expires_on' <<<"$res")"
+      fi ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------------------------------------------
+if want settings; then
+  step "settings: zone $ZONE"
+  others=$(cf GET "/zones/$ZID/dns_records?per_page=500" | jq -r --arg ip "$HOST_IP" \
+    '.result[] | select(.proxied and (.type=="A" or .type=="AAAA" or .type=="CNAME") and .content!=$ip) | "\(.type) \(.name) -> \(.content)"')
+  cur_ssl=$(cf GET "/zones/$ZID/settings/ssl" | jq -r .result.value)
+  if [[ -n "$others" && "$cur_ssl" != strict && "$FORCE_ZONE" != 1 ]]; then
+    printf '%s\n' "$others" | sed 's/^/       /'
+    die "these proxied records point at other servers; Full (strict) applies to the whole zone. Give each of them a valid origin certificate, then re-run with --force-zone"
+  fi
+  for kv in ssl=strict always_use_https=on min_tls_version=1.2 rocket_loader=off; do
+    k=${kv%%=*} v=${kv#*=}; cur=$(cf GET "/zones/$ZID/settings/$k" | jq -r .result.value)
+    if [[ "$cur" == "$v" ]]; then ok "$k = $v"
+    elif act "$k: $cur -> $v"; then cf PATCH "/zones/$ZID/settings/$k" "$(jq -n --arg v "$v" '{value:$v}')" >/dev/null; ok "$k = $v"; fi
+  done
+  if [[ "$BOT" != leave ]]; then
+    [[ "$BOT" == on || "$BOT" == off ]] || die "--bot-fight takes on, off or leave"
+    want_b=$([[ "$BOT" == on ]] && echo true || echo false)
+    cur=$(cf GET "/zones/$ZID/bot_management" | jq -r .result.fight_mode)
+    if [[ "$cur" == "$want_b" ]]; then ok "bot fight mode = $BOT"
+    elif act "bot fight mode -> $BOT"; then cf PUT "/zones/$ZID/bot_management" "{\"fight_mode\":$want_b}" >/dev/null; ok "bot fight mode = $BOT"; fi
+  else skip "bot fight mode left as $(cf GET "/zones/$ZID/bot_management" | jq -r 'if .result.fight_mode then "on" else "off" end')"; fi
+fi
+
+# ---------------------------------------------------------------------------------------------------------------
+if want site; then
+  step "site: $SITE_FILE -> $PROXY_DIR/conf/sites/$PROJECT.caddy"
+  on_host "test -f $CERT.pem -a -f $CERT.key" || die "no certificate for $ZONE on the box yet: run with step cert first"
+  grep -Eq "^[[:space:]]*import[[:space:]]+cloudflare_origin[[:space:]]+$ZONE\b" "$SITE_FILE" || die "the site file never does 'import cloudflare_origin $ZONE'"
+  blocks=$(grep -cE '^[^[:space:]#][^{]*\{[[:space:]]*$' "$SITE_FILE" || true); gates=$(grep -cE '^[[:space:]]*import[[:space:]]+cloudflare_origin' "$SITE_FILE" || true)
+  rps=$(grep -cE '^[[:space:]]*reverse_proxy[[:space:]]' "$SITE_FILE" || true); fwd=$(grep -cE '^[[:space:]]*import[[:space:]]+forward_client_ip' "$SITE_FILE" || true)
+  snips=$(grep -cE '^\([a-z0-9_]+\)[[:space:]]*\{' "$SITE_FILE" || true)
+  (( gates >= blocks - snips )) || die "every site block needs 'import cloudflare_origin $ZONE' as its first line ($gates of $((blocks - snips)))"
+  (( fwd >= rps )) || die "every reverse_proxy needs a block with 'import forward_client_ip' ($fwd of $rps)"
+  for up in $(grep -oE '^[[:space:]]*reverse_proxy[[:space:]]+[a-z0-9.-]+:[0-9]+' "$SITE_FILE" | awk '{print $2}' | sort -u); do
+    if on_host "docker exec proxy-caddy-1 wget -q -O /dev/null -T 3 http://$up/ 2>&1 | grep -q 'bad address'"; then
+      warn "upstream $up does not resolve on the proxy network yet (the site answers 502 until the project joins it)"
+    else ok "upstream $up resolves"; fi
+  done
+  dest=$PROXY_DIR/conf/sites/$PROJECT.caddy
+  if on_host "test -f $dest" && [[ "$(on_host "cat $dest")" == "$(cat "$SITE_FILE")" ]]; then ok "already installed, unchanged"
+  elif act "install $dest and reload (restore the old file if validation fails)"; then
+    bk=$PROXY_DIR/sites-backup/$PROJECT.caddy.$(date -u +%Y%m%dT%H%M%SZ)
+    had=$(on_host "mkdir -p $PROXY_DIR/sites-backup && if [ -f $dest ]; then cp -p $dest $bk && echo yes; fi")
+    on_host "cat > $dest.tmp" < "$SITE_FILE"; on_host "chmod 664 $dest.tmp && mv $dest.tmp $dest"
+    if ! out=$(on_host "$PROXY_DIR/reload.sh" 2>&1); then
+      printf '%s\n' "$out" | grep -vE '"level":"info"' | tail -5 >&2
+      if [[ "$had" == yes ]]; then on_host "cp -p $bk $dest"; else on_host "rm -f $dest"; fi    # this run's backup only
+      on_host "$PROXY_DIR/reload.sh >/dev/null 2>&1" || warn "reload after the restore failed too: another site file is broken"
+      die "the proxy refused the new site file; the previous state is restored"
+    fi
+    ok "installed and reloaded"
+  fi
+fi
+
+# ---------------------------------------------------------------------------------------------------------------
+if want dns; then
+  step "dns: ${NAMES// /, } -> $HOST_IP (proxied)"
+  for n in $NAMES; do
+    f=$(fqdn "$ZONE" "$n"); recs=$(cf GET "/zones/$ZID/dns_records?name=$f&per_page=100")
+    while read -r id type content; do
+      [[ -z "$id" ]] && continue
+      if [[ "$type" == AAAA || "$type" == CNAME ]]; then
+        if [[ "$REPLACE" == 1 ]]; then act "delete $type $f -> $content (conflicts)" && cf DELETE "/zones/$ZID/dns_records/$id" >/dev/null
+        else die "$f has a $type record ($content): this host is IPv4 A only. Re-run with --replace to delete it"; fi
+      fi
+    done < <(jq -r '.result[] | select(.type=="AAAA" or .type=="CNAME") | "\(.id) \(.type) \(.content)"' <<<"$recs")
+    a=$(jq -c '[.result[] | select(.type=="A")]' <<<"$recs")
+    case "$(jq length <<<"$a")" in
+      0) act "create A $f -> $HOST_IP proxied" && cf POST "/zones/$ZID/dns_records" \
+           "$(jq -n --arg n "$f" --arg ip "$HOST_IP" '{type:"A",name:$n,content:$ip,proxied:true,ttl:1}')" >/dev/null && ok "created $f" ;;
+      1) if [[ "$(jq -r '.[0].content + " " + (.[0].proxied|tostring)' <<<"$a")" == "$HOST_IP true" ]]; then ok "$f -> $HOST_IP proxied"
+         else act "update A $f: $(jq -r '.[0].content + " proxied=" + (.[0].proxied|tostring)' <<<"$a") -> $HOST_IP proxied" && cf PATCH "/zones/$ZID/dns_records/$(jq -r '.[0].id' <<<"$a")" \
+           "$(jq -n --arg ip "$HOST_IP" '{content:$ip,proxied:true,ttl:1}')" >/dev/null && ok "updated $f"; fi ;;
+      *) die "$f has several A records; fix by hand in Cloudflare" ;;
+    esac
+  done
+fi
+
+# ---------------------------------------------------------------------------------------------------------------
+if want verify; then
+  step "verify"
+  for n in $NAMES; do
+    f=$(fqdn "$ZONE" "$n"); edge=
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do    # a new record can take a moment to reach public resolvers
+      edge=$(dig +short A "$f" @1.1.1.1 | head -1); [[ -n "$edge" ]] && break; sleep 5
+    done
+    [[ -n "$edge" ]] || { warn "$f: no A record visible at 1.1.1.1 after 60 s"; continue; }
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 --resolve "$f:443:$edge" "https://$f/" || true)
+    case "$code" in
+      52[0-9]) warn "$f via Cloudflare: $code ($( case $code in 521) echo 'origin refused: proxy down or firewall blocks Cloudflare';;
+                 522) echo 'timed out: provider firewall does not admit Cloudflare on 443';; 525|526) echo 'TLS to origin failed: no or wrong origin cert';;
+                 *) echo 'Cloudflare could not reach the origin';; esac))" ;;
+      000) warn "$f via Cloudflare: no answer" ;;
+      502) warn "$f via Cloudflare: 502 (proxy is fine, the project upstream is not up or not on the proxy network)" ;;
+      *) ok "$f via Cloudflare: $code" ;;
+    esac
+  done
+  f=$(fqdn "$ZONE" "${NAMES%% *}")
+  if curl -sk -o /dev/null --max-time 6 --resolve "$f:443:$HOST_IP" "https://$f/"; then
+    warn "the origin answered a direct connection from this machine: check the provider firewall (80/443 from Cloudflare only)"
+  else ok "origin refuses direct connections"; fi
+fi
+echo

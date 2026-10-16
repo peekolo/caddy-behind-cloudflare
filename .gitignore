@@ -1,0 +1,12 @@
+# secrets: never commit, never copy to a server
+cloudflare.token
+*.token
+*.key
+*.csr
+proxy/.env
+proxy/certs/*.pem
+
+# your real servers: host records and the host table stay local (copy hosts/example.env, see CLAUDE.md section 2)
+hosts/*.env
+!hosts/example.env
+CLAUDE.local.md

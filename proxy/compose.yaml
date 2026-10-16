@@ -1,0 +1,80 @@
+# The shared front door on a host that runs several projects (deploy/shared-host.md). Lives at /srv/proxy/.
+# It is the only container that publishes host ports. Projects join the external network `proxy` with a unique
+# alias and drop one site file into conf/sites/ (conf/Caddyfile imports sites/*.caddy).
+#
+# Every site is behind Cloudflare (orange cloud, SSL "Full (strict)"): Caddy serves Cloudflare Origin CA certificates
+# from certs/, trusts CF-Connecting-IP only from Cloudflare's ranges (cloudflare.env) and drops every other source.
+#
+# Once per host:  docker network create --subnet 10.89.0.0/24 proxy
+# Start:          docker compose up -d --wait
+# After editing a site file or a certificate:  ./reload.sh   (validates first; a bad file never reaches the proxy)
+# After ./cloudflare-ips.sh changed cloudflare.env:  docker compose up -d --wait caddy   (env is read at start)
+name: proxy
+
+x-logging: &journald            # age-limited by journald (14 days, host drop-in), not by Docker's size rotation
+  logging:
+    driver: journald
+    options:
+      tag: "{{.Name}}"
+
+services:
+  caddy-init:                   # one-shot: named volumes are root-owned; caddy runs as uid 1000
+    image: caddy:2.10-alpine
+    user: "0:0"
+    restart: "no"
+    entrypoint: ["chown", "-R", "1000:1000", "/data", "/config"]
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "DAC_OVERRIDE"]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    <<: *journald
+
+  caddy:
+    image: caddy:2.10-alpine
+    user: "1000:1000"
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    security_opt: ["no-new-privileges:true"]
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+    group_add: ["${DEPLOY_GID:?DEPLOY_GID is required}"]    # reads certs/*.key (mode 640, group deploy)
+    ports:                                  # Cloudflare reaches origins over TCP only, so no 443/udp (HTTP/3)
+      - "80:80"
+      - "443:443"
+    env_file: [cloudflare.env]              # CF_RANGES
+    environment:
+      LOCAL_RANGES: ${LOCAL_RANGES:-10.89.0.1/32}
+    volumes:
+      - ./conf:/etc/caddy:ro                # a directory, so new site files and editors that replace files just work
+      - ./certs:/certs:ro                   # Cloudflare Origin CA certs: <zone>.pem + <zone>.key, keys never leave the box
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [proxy]
+    depends_on:
+      caddy-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    mem_limit: 192m
+    cpus: 1.0
+    pids_limit: 256
+    <<: *journald
+
+networks:
+  proxy:
+    external: true
+    name: proxy
+
+volumes:
+  caddy_data:
+  caddy_config:

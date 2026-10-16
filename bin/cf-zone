@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# cf-zone <zone>: read-only view of a Cloudflare zone: DNS records, the settings site-add manages, origin certificates.
+source "$(dirname "$0")/../lib/common.sh"
+need curl jq
+Z=${1:-}; [[ -n "$Z" ]] || die "usage: bin/cf-zone <zone>"
+ZID=$(cf_zone_id "$Z")
+step "$Z ($ZID, $(cf GET "/zones/$ZID" | jq -r '.result.plan.name + ", " + .result.status'))"
+cf GET "/zones/$ZID/dns_records?per_page=500" | jq -r '.result[] | "  \(.type)\t\(.name)\t\(.content)\t\(if .proxied then "proxied" else "dns-only" end)"' | column -t -s $'\t'
+step "settings"
+for k in ssl always_use_https min_tls_version rocket_loader; do printf '  %-18s %s\n' "$k" "$(cf GET "/zones/$ZID/settings/$k" | jq -r .result.value)"; done
+printf '  %-18s %s\n' bot_fight_mode "$(cf GET "/zones/$ZID/bot_management" | jq -r 'if .result.fight_mode then "on" else "off" end')"
+step "origin certificates"
+cf GET "/certificates?zone_id=$ZID" | jq -r '.result[] | "  \(.hostnames|join(","))  expires \(.expires_on)  id \(.id)"'
