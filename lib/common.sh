@@ -28,8 +28,13 @@ load_host() {
   [[ -n "$HOST_IP" && -n "$HOST_SSH" ]] || die "$f needs IP= and SSH="
 }
 
+# One shared ssh connection per host for every on_host and rsync call: serverbeef rate-limits SSH in ufw
+# (`ufw limit`: 6 new connections in 30 s from one address are rejected), and a script makes dozens of calls.
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto -o "ControlPath=~/.ssh/aideploy-%C" -o ControlPersist=60)
+export RSYNC_RSH="ssh ${SSH_OPTS[*]}"
+
 # on_host <command...>: run on the box as the deploy user (no tty, fails on error).
-on_host() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST_SSH" "$@"; }
+on_host() { ssh "${SSH_OPTS[@]}" "$HOST_SSH" "$@"; }
 
 # ---- Cloudflare API (token from cloudflare.token or CF_API_TOKEN; never printed, never sent to a server) ------
 
