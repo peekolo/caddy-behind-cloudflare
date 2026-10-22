@@ -142,7 +142,7 @@ the registrar. The token covers every zone in the account, so nothing else is ne
   3. upstream = your alias on `proxy`, never a bare service name (`web`, `api` exist in every project)
   4. snippets available: `security_headers` (or `hsts_only` if the app sets its own headers), `access_log`
      (journald, visitor IP, query strings cut, credentials redacted). A snippet of your own needs a project prefix
-     (`(tc_something)`); snippet names are global on the host.
+     (`(sh_something)`); snippet names are global on the host.
 
   ```caddyfile
   www.example.com {
@@ -189,7 +189,9 @@ bin/site-add --host <host> --zone <zone> --project <project> \
 
 It installs the site file (validated; the previous one is restored if the proxy refuses it), points each name at the
 host (proxied), and verifies: each name answers through Cloudflare, and the origin refuses a direct connection.
-Then `bin/host-check <host>` and update section 2.
+Then `bin/host-check <host>`, update section 2, and check the real client IP: a request made through Cloudflare must show
+up in the app's own log with the visitor's address. `10.89.0.x` there means the app does not trust the proxy subnet
+(section 4.2); fix that before handing the site over, because rate limits and abuse logs key on that address.
 
 ## 5. Day-2 operations
 
