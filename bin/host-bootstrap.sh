@@ -9,12 +9,12 @@
 # Without options it asks for the admin user (default: who ran sudo), the projects to create now (optional:
 # bin/project-add creates them later) and the journald log driver, then shows a summary and waits for a yes.
 #
-# Prerequisite: ../serverbeef/serverbeef.sh already ran on this box with `--docker --docker-user deploy` (SSH on its
+# Prerequisite: ../serverbeef/serverbeef.sh already ran on this box with `--docker` (SSH on its
 # own port, ufw, fail2ban, unattended upgrades, swap, and rootless Docker running as `deploy`: the root daemon is off
 # and nobody is in the docker group, so nothing an agent does through Docker can reach root). This script does NOT
 # repeat any of that. It adds:
 #   1. journald: no log entry older than 14 days (overrides serverbeef's 1 month), one file per day
-#   2. the `deploy` user's SSH keys (same as the admin's) and ssh-users group; NO sudo, NO docker group
+#   2. checks the `deploy` user serverbeef made: ssh-users group, its own key (never the admin's), NO sudo, NO docker group
 #   3. /srv owned by deploy (so bin/project-add can add projects later without root), /srv/proxy and
 #      /srv/<project> per --projects, group-writable (setgid)
 #   4. optional --docker-journald: journald as the default log driver of deploy's daemon (restarts it; containers
@@ -51,7 +51,7 @@ if [[ $NARGS -eq 0 ]]; then
   done
   j=""; ask j "journald as the default log driver of deploy's Docker (restarts it)? y/n" y
   [[ "$j" =~ ^[Yy] ]] && DOCKER_JOURNALD=1 || DOCKER_JOURNALD=0
-  echo; echo "  Admin user ........ $ADMIN (gets the deploy group; deploy gets $ADMIN's SSH keys, no sudo)"
+  echo; echo "  Admin user ........ $ADMIN (joins the deploy group for shared files; deploy keeps its own key, no sudo)"
   echo "  Projects .......... ${PROJECTS:-none now}"
   echo "  Docker logs ....... $([[ $DOCKER_JOURNALD == 1 ]] && echo journald || echo unchanged)"
   echo "  Also: journald keeps 14 days, /srv is handed to deploy"
@@ -61,11 +61,11 @@ fi
 valid_admin "$ADMIN" || { echo "--admin <existing sudo user other than root and deploy> is required" >&2; exit 1; }
 valid_projects "$PROJECTS" || { echo "--projects: names are lowercase letters, digits and dashes" >&2; exit 1; }
 getent group ssh-users >/dev/null || { echo "group ssh-users missing: run serverbeef.sh first" >&2; exit 1; }
-id deploy >/dev/null 2>&1 || { echo "user deploy is missing: run serverbeef.sh with --docker --docker-user deploy first" >&2; exit 1; }
+id deploy >/dev/null 2>&1 || { echo "user deploy is missing: run serverbeef.sh with --docker first" >&2; exit 1; }
 DEPLOY_UID=$(id -u deploy)
 DEPLOY_HOME=$(getent passwd deploy | cut -d: -f6)
 [[ -S "/run/user/$DEPLOY_UID/docker.sock" ]] \
-  || { echo "deploy has no rootless Docker daemon: run serverbeef.sh with --docker --docker-user deploy" >&2; exit 1; }
+  || { echo "deploy has no rootless Docker daemon: run serverbeef.sh with --docker" >&2; exit 1; }
 # run a command as deploy, with what its systemd user instance and Docker need
 as_deploy() {
   runuser -u deploy -- env HOME="$DEPLOY_HOME" USER=deploy LOGNAME=deploy XDG_RUNTIME_DIR="/run/user/$DEPLOY_UID" \
@@ -92,12 +92,10 @@ usermod -aG ssh-users deploy
 # the docker group is root on a root daemon; deploy never gets it (an older bootstrap added it)
 if id -nG deploy | tr ' ' '\n' | grep -qx docker; then gpasswd -d deploy docker >/dev/null; fi
 usermod -aG deploy "$ADMIN"
-install -d -m 700 -o deploy -g deploy "$DEPLOY_HOME/.ssh"
-admin_home=$(getent passwd "$ADMIN" | cut -d: -f6)
-if [[ -s "$admin_home/.ssh/authorized_keys" ]]; then
-  touch "$DEPLOY_HOME/.ssh/authorized_keys"
-  sort -u "$admin_home/.ssh/authorized_keys" "$DEPLOY_HOME/.ssh/authorized_keys" -o "$DEPLOY_HOME/.ssh/authorized_keys"
-  chown deploy:deploy "$DEPLOY_HOME/.ssh/authorized_keys"; chmod 600 "$DEPLOY_HOME/.ssh/authorized_keys"
+# deploy logs in with its own key (serverbeef --deploy-key, made by serverbeef-local.sh), never the admin's:
+# an agent holding the deploy key must not be able to log in as the admin, and the other way round.
+if [[ ! -s "$DEPLOY_HOME/.ssh/authorized_keys" ]]; then
+  echo "WARNING: deploy has no SSH key; nothing can deploy yet. Add one: sudo serverbeef --deploy-key '<public key>'" >&2
 fi
 if sudo -l -U deploy 2>/dev/null | grep -q '(ALL'; then echo "WARNING: deploy has sudo rights; it should not" >&2; fi
 if systemctl is-active --quiet docker; then echo "WARNING: the root Docker daemon is running; serverbeef --docker turns it off" >&2; fi

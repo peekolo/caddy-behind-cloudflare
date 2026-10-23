@@ -10,7 +10,7 @@ load_host "$H"
 
 step "1. reach $HOST_SSH as deploy"
 on_host "docker info --format '{{.SecurityOptions}}' 2>/dev/null" | grep -q rootless \
-  || die "deploy on $HOST_NAME has no rootless Docker daemon (serverbeef --docker --docker-user deploy, then bin/host-bootstrap.sh)"
+  || die "deploy on $HOST_NAME has no rootless Docker daemon (serverbeef --docker, then bin/host-bootstrap.sh)"
 on_host "test -d $PROXY_DIR -a -w $PROXY_DIR" || die "$PROXY_DIR missing or not writable (run bin/host-bootstrap.sh)"
 ok "deploy@$HOST_NAME, rootless Docker, $PROXY_DIR writable"
 

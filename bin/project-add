@@ -50,7 +50,7 @@ GITHUB_HOST_KEY='github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6
 
 step "preflight: $PROJECT on $HOST_NAME ($HOST_IP) as deploy"
 on_host "docker info --format '{{.SecurityOptions}}' 2>/dev/null" | grep -q rootless \
-  || die "deploy on $HOST_NAME has no rootless Docker daemon (serverbeef --docker --docker-user deploy, then bin/host-bootstrap.sh)"
+  || die "deploy on $HOST_NAME has no rootless Docker daemon (serverbeef --docker, then bin/host-bootstrap.sh)"
 on_host "docker network inspect $PROXY_NET >/dev/null 2>&1" || die "network $PROXY_NET missing (run bin/proxy-install $HOSTN first)"
 if on_host "test -d $DIR"; then
   on_host "test -w $DIR" || die "$DIR exists but deploy cannot write it (re-run bin/host-bootstrap.sh)"

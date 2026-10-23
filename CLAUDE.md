@@ -79,19 +79,20 @@ table before you use it.
 from source **Cloudflare** (Vultr has it as a source; elsewhere enter the IPv4 ranges from `proxy/cloudflare.env`),
 nothing else. No IPv6 unless you plan for it (then AAAA records and the IPv6 ranges too).
 
-**3.2 Owner, root: serverbeef.** `../serverbeef/serverbeef.sh` hardens the box (SSH on `<ssh-port>`, key-only, ufw,
-fail2ban, unattended upgrades, swap) and installs rootless Docker running as `deploy`, which it creates. Run it
-with **your own admin name, never `deploy`** (its default), because `deploy` must not get sudo, and with
-`--sudo-password` so that root stays behind a password only you know (it prompts for one, or generates one and
-prints it once to your terminal):
+**3.2 Owner: serverbeef.** On the workstation, `bash ../serverbeef/serverbeef-local.sh` makes the admin key (passphrase)
+and the deploy key (none), writes the ssh aliases `<host>` and `<host>_deploy`, and uploads `serverbeef.sh` with
+the answers (admin name, port, both public keys) to root on the fresh box. Then, as root on the box,
+`serverbeef.sh` hardens it (SSH on `<ssh-port>`, key-only, ufw, fail2ban, unattended upgrades, swap), creates the
+admin (sudo behind a password only the owner knows, the default) and `deploy` (its own key, no sudo, no password)
+and installs rootless Docker running as `deploy`:
 
 ```bash
-scp ../serverbeef/serverbeef.sh root@<ip>:     # first login is root on port 22
-ssh -t root@<ip> 'bash serverbeef.sh --user <admin> --sudo-password --ssh-port <ssh-port> --docker --docker-user deploy --udp-ports none'
-# keep that session open; test `ssh -p <ssh-port> <admin>@<ip>` and `sudo -v` from a new terminal before closing it
+bash ../serverbeef/serverbeef-local.sh                        # workstation: keys, aliases, upload
+ssh -t root@<ip> 'bash serverbeef.sh --config serverbeef-<host>.conf'   # on the box; answer yes to Docker, keep rootless
+# keep that session open; test `ssh <host>` and `sudo -v` from a new terminal before closing it
 ```
 
-**3.3 Owner, root: bootstrap.** journald 14 days, `deploy`'s SSH keys (same as the admin's) and `/srv` (owned by
+**3.3 Owner, root: bootstrap.** journald 14 days, a check of `deploy` (its own key, no sudo) and `/srv` (owned by
 `deploy`; `--projects` is optional, `bin/project-add` creates `/srv/<project>` itself):
 
 ```bash
@@ -99,12 +100,13 @@ scp -P <ssh-port> bin/host-bootstrap.sh <admin>@<ip>:
 ssh -t -p <ssh-port> <admin>@<ip> 'sudo bash host-bootstrap.sh'      # asks: admin user, projects, journald; then a yes
 ```
 
-Without options it asks (defaults: the user who ran sudo, no projects, journald on). For an unattended run pass
+Without options it asks (defaults: the user who ran sudo, no projects, journald on). The admin's keys are never
+copied to `deploy`: the two accounts have different keys on purpose. For an unattended run pass
 `--admin <admin> [--projects "<project> <project>"] [--docker-journald]`; `--docker-journald` makes journald the
 default log driver of `deploy`'s daemon (restarts it; containers with a restart policy come back).
 
-**3.4 Workstation (agent or human).** Add ssh aliases (`<host>` for the admin, `<host>_deploy` for deploy, both on
-`<ssh-port>`; the port lives only there and in the firewall group, never in this repo), write `hosts/<host>.env` (copy
+**3.4 Workstation (agent or human).** The ssh aliases (`<host>` for the admin, `<host>_deploy` for deploy, both on
+`<ssh-port>`) exist since 3.2; the port lives only there and in the firewall group, never in this repo. Write `hosts/<host>.env` (copy
 `hosts/example.env`), add the row to the host table (section 2), then:
 
 ```bash

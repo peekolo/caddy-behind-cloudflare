@@ -106,7 +106,8 @@ changing anything, can be re-run, and takes `--dry-run`.
 ### Requirements
 
 - Ubuntu 26.04 servers with rootless Docker running as `deploy`, key-only SSH on a port of your choosing (one per
-  server). The runbook uses a separate hardening script (serverbeef) for this; any equivalent setup works.
+  server), and separate keys for the admin and for `deploy`. The runbook uses a separate hardening script
+  (serverbeef, with its workstation helper `serverbeef-local.sh`) for this; any equivalent setup works.
 - A provider firewall in front of each server that can restrict 80/443 to Cloudflare: the layer that does not
   depend on the box being intact.
 - Domains on Cloudflare (the Free plan is fine) and a custom API token with Zone Read, DNS Edit, Zone Settings Edit,
