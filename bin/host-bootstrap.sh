@@ -3,7 +3,11 @@
 # Runs ON the box, as root. Idempotent: safe to re-run (it only adds what is missing).
 #
 #   scp -P <ssh-port> bin/host-bootstrap.sh <admin>@<ip>:   (or: scp bin/host-bootstrap.sh <admin-ssh-alias>:)
-#   ssh -t <admin-ssh-alias> 'sudo bash host-bootstrap.sh --admin <admin> --projects "app1 app2"'
+#   ssh -t <admin-ssh-alias> 'sudo bash host-bootstrap.sh'                # asks the questions below
+#   ssh -t <admin-ssh-alias> 'sudo bash host-bootstrap.sh --admin <admin> [--projects "app1 app2"] [--docker-journald]'
+#
+# Without options it asks for the admin user (default: who ran sudo), the projects to create now (optional:
+# bin/project-add creates them later) and the journald log driver, then shows a summary and waits for a yes.
 #
 # Prerequisite: ../serverbeef/serverbeef.sh already ran on this box with `--docker --docker-user deploy` (SSH on its
 # own port, ufw, fail2ban, unattended upgrades, swap, and rootless Docker running as `deploy`: the root daemon is off
@@ -17,18 +21,45 @@
 #      with a restart policy come back)
 set -Eeuo pipefail
 
-ADMIN="" PROJECTS="" DOCKER_JOURNALD=0
+ADMIN="" PROJECTS="" DOCKER_JOURNALD=0 NARGS=$#
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --admin) ADMIN=$2; shift 2 ;;
     --projects) PROJECTS=$2; shift 2 ;;       # optional: bin/project-add creates /srv/<project> too
     --docker-journald) DOCKER_JOURNALD=1; shift ;;
-    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 1 ;;
   esac
 done
 [[ $EUID -eq 0 ]] || { echo "run as root (sudo bash $0 ...)" >&2; exit 1; }
-[[ -n "$ADMIN" ]] && id "$ADMIN" >/dev/null 2>&1 || { echo "--admin <existing sudo user> is required" >&2; exit 1; }
+
+valid_admin() { [[ -n "$1" && "$1" != root && "$1" != deploy ]] && id "$1" >/dev/null 2>&1; }
+valid_projects() { local p; for p in $1; do [[ "$p" =~ ^[a-z0-9][a-z0-9-]*$ ]] || return 1; done; }
+if [[ $NARGS -eq 0 ]]; then
+  # No options: ask. Prompts read from /dev/tty so the answers never come from a pipe.
+  { : < /dev/tty; } 2>/dev/null || { echo "no options and no terminal: pass --admin <user> (see --help)" >&2; exit 1; }
+  ask() { local __ans; read -r -p "  $2 [${3:-none}]: " __ans < /dev/tty || { echo; echo "no answer: nothing changed"; exit 1; }; printf -v "$1" '%s' "${__ans:-$3}"; }
+  guess=${SUDO_USER:-}; valid_admin "$guess" || guess=$(getent group sudo | cut -d: -f4 | tr ',' '\n' | grep -vxE 'root|deploy|' | head -1)
+  echo "host-bootstrap: the root steps that make this box a caddy-behind-cloudflare host. Enter keeps the default."
+  until valid_admin "$ADMIN"; do
+    [[ -z "$ADMIN" ]] || echo "    $ADMIN is not an existing user other than root and deploy"
+    ask ADMIN "Admin user (the sudo user from serverbeef)" "$guess"
+  done
+  while :; do
+    ask PROJECTS "Projects to create under /srv now, space separated (bin/project-add can add them later)" ""
+    valid_projects "$PROJECTS" && break; echo "    names are lowercase letters, digits and dashes"
+  done
+  j=""; ask j "journald as the default log driver of deploy's Docker (restarts it)? y/n" y
+  [[ "$j" =~ ^[Yy] ]] && DOCKER_JOURNALD=1 || DOCKER_JOURNALD=0
+  echo; echo "  Admin user ........ $ADMIN (gets the deploy group; deploy gets $ADMIN's SSH keys, no sudo)"
+  echo "  Projects .......... ${PROJECTS:-none now}"
+  echo "  Docker logs ....... $([[ $DOCKER_JOURNALD == 1 ]] && echo journald || echo unchanged)"
+  echo "  Also: journald keeps 14 days, /srv is handed to deploy"
+  go=""; ask go "Proceed? y/n" y; [[ "$go" =~ ^[Yy] ]] || { echo "nothing changed"; exit 1; }
+  echo
+fi
+valid_admin "$ADMIN" || { echo "--admin <existing sudo user other than root and deploy> is required" >&2; exit 1; }
+valid_projects "$PROJECTS" || { echo "--projects: names are lowercase letters, digits and dashes" >&2; exit 1; }
 getent group ssh-users >/dev/null || { echo "group ssh-users missing: run serverbeef.sh first" >&2; exit 1; }
 id deploy >/dev/null 2>&1 || { echo "user deploy is missing: run serverbeef.sh with --docker --docker-user deploy first" >&2; exit 1; }
 DEPLOY_UID=$(id -u deploy)

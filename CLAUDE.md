@@ -96,11 +96,12 @@ ssh -t root@<ip> 'bash serverbeef.sh --user <admin> --sudo-password --ssh-port <
 
 ```bash
 scp -P <ssh-port> bin/host-bootstrap.sh <admin>@<ip>:
-ssh -t -p <ssh-port> <admin>@<ip> 'sudo bash host-bootstrap.sh --admin <admin> --projects "<project> <project>"'
+ssh -t -p <ssh-port> <admin>@<ip> 'sudo bash host-bootstrap.sh'      # asks: admin user, projects, journald; then a yes
 ```
 
-Optional `--docker-journald` makes journald the default log driver of `deploy`'s daemon (restarts it; containers
-with a restart policy come back).
+Without options it asks (defaults: the user who ran sudo, no projects, journald on). For an unattended run pass
+`--admin <admin> [--projects "<project> <project>"] [--docker-journald]`; `--docker-journald` makes journald the
+default log driver of `deploy`'s daemon (restarts it; containers with a restart policy come back).
 
 **3.4 Workstation (agent or human).** Add ssh aliases (`<host>` for the admin, `<host>_deploy` for deploy, both on
 `<ssh-port>`; the port lives only there and in the firewall group, never in this repo), write `hosts/<host>.env` (copy
