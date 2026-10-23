@@ -92,8 +92,9 @@ changing anything, can be re-run, and takes `--dry-run`.
 
 - The Cloudflare API token stays on the workstation, and no server holds a credential that can change DNS. The token
   is scoped to DNS, zone settings, SSL and bot settings; it cannot delete zones or touch billing.
-- Each server has two users: an admin with sudo for the few root steps, and `deploy` (Docker group, no sudo) for
-  everything else. An agent only ever gets `deploy`.
+- Each server has two users: an admin whose sudo asks for a password only the owner knows, for the few root
+  steps, and `deploy` (its own rootless Docker daemon, no sudo, no docker group) for everything else. An agent
+  only ever gets `deploy`, and nothing it does through Docker can reach root.
 - Going live always follows the same order: certificate, zone settings, project running, site file, DNS, verify.
   DNS changes last, so a visitor never reaches a name the server cannot answer yet.
 - Caddy sends the app exactly one client IP in `X-Forwarded-For` and `X-Real-IP`, taken from Cloudflare's
@@ -103,10 +104,10 @@ changing anything, can be re-run, and takes `--dry-run`.
 
 ### Requirements
 
-- Ubuntu 26.04 servers with Docker, key-only SSH on a port of your choosing (one per server). The runbook uses a
-  separate hardening script (serverbeef) for this; any equivalent setup works.
-- A provider firewall in front of each server that can restrict 80/443 to Cloudflare. Docker-published ports bypass
-  ufw, so the host firewall alone is not enough.
+- Ubuntu 26.04 servers with rootless Docker running as `deploy`, key-only SSH on a port of your choosing (one per
+  server). The runbook uses a separate hardening script (serverbeef) for this; any equivalent setup works.
+- A provider firewall in front of each server that can restrict 80/443 to Cloudflare: the layer that does not
+  depend on the box being intact.
 - Domains on Cloudflare (the Free plan is fine) and a custom API token with Zone Read, DNS Edit, Zone Settings Edit,
   SSL and Certificates Edit, and Bot Management Edit.
 - On the workstation: bash, ssh, scp, rsync, curl, jq, openssl and dig.
@@ -132,7 +133,8 @@ this into a public repo.
 
 ### Not covered yet
 
-- Servers with no provider firewall. They would need `DOCKER-USER` iptables rules limited to Cloudflare.
+- Servers with no provider firewall. Rootless Docker's ports obey ufw, so ufw rules limited to Cloudflare's ranges
+  would do; not built.
 - Authenticated Origin Pulls (mTLS between Cloudflare and the origin).
 - IPv6.
 

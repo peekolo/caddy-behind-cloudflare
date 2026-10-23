@@ -5,13 +5,15 @@
 #   scp -P <ssh-port> bin/host-bootstrap.sh <admin>@<ip>:   (or: scp bin/host-bootstrap.sh <admin-ssh-alias>:)
 #   ssh -t <admin-ssh-alias> 'sudo bash host-bootstrap.sh --admin <admin> --projects "app1 app2"'
 #
-# Prerequisite: ../serverbeef/serverbeef.sh already ran on this box with --docker (SSH on its own port, ufw, fail2ban,
-# unattended upgrades, swap, Docker). This script does NOT repeat any of that. It adds:
+# Prerequisite: ../serverbeef/serverbeef.sh already ran on this box with `--docker --docker-user deploy` (SSH on its
+# own port, ufw, fail2ban, unattended upgrades, swap, and rootless Docker running as `deploy`: the root daemon is off
+# and nobody is in the docker group, so nothing an agent does through Docker can reach root). This script does NOT
+# repeat any of that. It adds:
 #   1. journald: no log entry older than 14 days (overrides serverbeef's 1 month), one file per day
-#   2. the `deploy` user: docker + ssh-users groups, NO sudo, same SSH keys as the admin
+#   2. the `deploy` user's SSH keys (same as the admin's) and ssh-users group; NO sudo, NO docker group
 #   3. /srv/proxy and /srv/<project> per project, owned by deploy, group-writable (setgid)
-#   4. optional --docker-journald: Docker's default log driver -> journald (restarts dockerd; live-restore keeps
-#      containers running)
+#   4. optional --docker-journald: journald as the default log driver of deploy's daemon (restarts it; containers
+#      with a restart policy come back)
 set -Eeuo pipefail
 
 ADMIN="" PROJECTS="" DOCKER_JOURNALD=0
@@ -20,14 +22,23 @@ while [[ $# -gt 0 ]]; do
     --admin) ADMIN=$2; shift 2 ;;
     --projects) PROJECTS=$2; shift 2 ;;
     --docker-journald) DOCKER_JOURNALD=1; shift ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 1 ;;
   esac
 done
 [[ $EUID -eq 0 ]] || { echo "run as root (sudo bash $0 ...)" >&2; exit 1; }
 [[ -n "$ADMIN" ]] && id "$ADMIN" >/dev/null 2>&1 || { echo "--admin <existing sudo user> is required" >&2; exit 1; }
-command -v docker >/dev/null || { echo "Docker is missing: run serverbeef.sh with --docker first" >&2; exit 1; }
 getent group ssh-users >/dev/null || { echo "group ssh-users missing: run serverbeef.sh first" >&2; exit 1; }
+id deploy >/dev/null 2>&1 || { echo "user deploy is missing: run serverbeef.sh with --docker --docker-user deploy first" >&2; exit 1; }
+DEPLOY_UID=$(id -u deploy)
+DEPLOY_HOME=$(getent passwd deploy | cut -d: -f6)
+[[ -S "/run/user/$DEPLOY_UID/docker.sock" ]] \
+  || { echo "deploy has no rootless Docker daemon: run serverbeef.sh with --docker --docker-user deploy" >&2; exit 1; }
+# run a command as deploy, with what its systemd user instance and Docker need
+as_deploy() {
+  runuser -u deploy -- env HOME="$DEPLOY_HOME" USER=deploy LOGNAME=deploy XDG_RUNTIME_DIR="/run/user/$DEPLOY_UID" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$DEPLOY_UID/bus" DOCKER_HOST="unix:///run/user/$DEPLOY_UID/docker.sock" "$@"
+}
 
 echo "== 1. journald: 14 days at most"
 cat > /etc/systemd/journald.conf.d/95-aideploy-retention.conf <<'CONF'
@@ -45,18 +56,25 @@ journalctl --vacuum-time=13d >/dev/null 2>&1 || true
 systemd-analyze cat-config systemd/journald.conf | grep -E '^MaxRetentionSec' | tail -1
 
 echo "== 2. deploy user"
-id deploy >/dev/null 2>&1 || adduser --disabled-password --gecos "" deploy
-usermod -aG docker,ssh-users deploy
+usermod -aG ssh-users deploy
+# the docker group is root on a root daemon; deploy never gets it (an older bootstrap added it)
+if id -nG deploy | tr ' ' '\n' | grep -qx docker; then gpasswd -d deploy docker >/dev/null; fi
 usermod -aG deploy "$ADMIN"
-install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
+install -d -m 700 -o deploy -g deploy "$DEPLOY_HOME/.ssh"
 admin_home=$(getent passwd "$ADMIN" | cut -d: -f6)
 if [[ -s "$admin_home/.ssh/authorized_keys" ]]; then
-  touch /home/deploy/.ssh/authorized_keys
-  sort -u "$admin_home/.ssh/authorized_keys" /home/deploy/.ssh/authorized_keys -o /home/deploy/.ssh/authorized_keys
-  chown deploy:deploy /home/deploy/.ssh/authorized_keys; chmod 600 /home/deploy/.ssh/authorized_keys
+  touch "$DEPLOY_HOME/.ssh/authorized_keys"
+  sort -u "$admin_home/.ssh/authorized_keys" "$DEPLOY_HOME/.ssh/authorized_keys" -o "$DEPLOY_HOME/.ssh/authorized_keys"
+  chown deploy:deploy "$DEPLOY_HOME/.ssh/authorized_keys"; chmod 600 "$DEPLOY_HOME/.ssh/authorized_keys"
 fi
 if sudo -l -U deploy 2>/dev/null | grep -q '(ALL'; then echo "WARNING: deploy has sudo rights; it should not" >&2; fi
+if systemctl is-active --quiet docker; then echo "WARNING: the root Docker daemon is running; serverbeef --docker turns it off" >&2; fi
 id deploy
+if as_deploy docker info --format '{{.ServerVersion}} {{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+  echo "  rootless Docker $(as_deploy docker version --format '{{.Server.Version}}') runs as deploy"
+else
+  echo "deploy's rootless Docker daemon is not answering: sudo -iu deploy systemctl --user status serverbeef-docker" >&2; exit 1
+fi
 
 echo "== 3. /srv folders"
 for d in proxy $PROJECTS backups; do
@@ -65,16 +83,19 @@ done
 ls -la /srv
 
 if [[ $DOCKER_JOURNALD == 1 ]]; then
-  echo "== 4. Docker default log driver -> journald"
-  python3 - <<'PY'
+  echo "== 4. deploy's Docker: default log driver -> journald"
+  as_deploy python3 - <<'PY'
 import json, os
-p = "/etc/docker/daemon.json"
+p = os.path.expanduser("~/.config/docker/daemon.json")
+os.makedirs(os.path.dirname(p), exist_ok=True)
 d = json.load(open(p)) if os.path.exists(p) else {}
-d["log-driver"] = "journald"; d.pop("log-opts", None); d["live-restore"] = True
+d["log-driver"] = "journald"; d.pop("log-opts", None)
 json.dump(d, open(p, "w"), indent=2); print(open(p).read())
 PY
-  systemctl restart docker && docker ps --format '{{.Names}} {{.Status}}'
+  as_deploy systemctl --user restart serverbeef-docker.service
+  sleep 3
+  as_deploy docker ps --format '{{.Names}} {{.Status}}'
 fi
 
 echo
-echo "Done. deploy's gid is $(id -g deploy) (DEPLOY_GID in /srv/proxy/.env). Next, from the workstation: bin/proxy-install <host>."
+echo "Done. Next, from the workstation: bin/proxy-install <host>."

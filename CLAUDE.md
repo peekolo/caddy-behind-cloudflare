@@ -20,10 +20,12 @@ Docker will do).
 3. **One front door per server: the shared Caddy in `/srv/proxy`.** It is the only container that publishes host
    ports (80, 443). Projects never publish ports; they join the Docker network `proxy` (10.89.0.0/24) under a
    unique alias. This is true on individual servers too (section 8).
-4. **Origin lock, twice.** The provider firewall admits 80/443 from Cloudflare only (Docker skips ufw), and Caddy
-   drops any connection not from Cloudflare's ranges. A request that reaches an app came through Cloudflare.
-5. **Two users.** The admin user (from serverbeef, has sudo, the owner's) does root steps only. Everything else
-   runs as `deploy`: docker group, **no sudo**, owns `/srv/*`. Agents never have sudo; root steps are the owner's.
+4. **Origin lock, twice.** The provider firewall admits 80/443 from Cloudflare only (the layer that does not depend
+   on the box; rootless Docker's published ports also obey ufw), and Caddy drops any connection not from
+   Cloudflare's ranges. A request that reaches an app came through Cloudflare.
+5. **Two users, root behind a password.** The admin user (from serverbeef, sudo with a password only the owner
+   knows) does root steps only. Everything else runs as `deploy`: its own rootless Docker daemon, **no sudo, no
+   docker group**, owns `/srv/*`. Agents never have sudo, and nothing they do through Docker can reach root.
 6. **Logs live 14 days at most** (journald, host-wide). Containers log to journald.
 7. **Order that never breaks a live site:** certificate -> zone settings -> project up on `proxy` -> site file
    -> DNS -> verify. `bin/site-add` runs exactly that.
@@ -78,23 +80,26 @@ from source **Cloudflare** (Vultr has it as a source; elsewhere enter the IPv4 r
 nothing else. No IPv6 unless you plan for it (then AAAA records and the IPv6 ranges too).
 
 **3.2 Owner, root: serverbeef.** `../serverbeef/serverbeef.sh` hardens the box (SSH on `<ssh-port>`, key-only, ufw,
-fail2ban, unattended upgrades, swap, Docker). Run it with **your own admin name, never `deploy`** (its default),
-because `deploy` must not get sudo:
+fail2ban, unattended upgrades, swap) and installs rootless Docker running as `deploy`, which it creates. Run it
+with **your own admin name, never `deploy`** (its default), because `deploy` must not get sudo, and with
+`--sudo-password` so that root stays behind a password only you know (it prompts for one, or generates one and
+prints it once to your terminal):
 
 ```bash
 scp ../serverbeef/serverbeef.sh root@<ip>:     # first login is root on port 22
-ssh -t root@<ip> 'bash serverbeef.sh --user <admin> --ssh-port <ssh-port> --docker --udp-ports none'
-# keep that session open; test `ssh -p <ssh-port> <admin>@<ip>` from a new terminal before closing it
+ssh -t root@<ip> 'bash serverbeef.sh --user <admin> --sudo-password --ssh-port <ssh-port> --docker --docker-user deploy --udp-ports none'
+# keep that session open; test `ssh -p <ssh-port> <admin>@<ip>` and `sudo -v` from a new terminal before closing it
 ```
 
-**3.3 Owner, root: bootstrap.** journald 14 days, the `deploy` user (same SSH keys as the admin), `/srv/*`:
+**3.3 Owner, root: bootstrap.** journald 14 days, `deploy`'s SSH keys (same as the admin's) and `/srv/*`:
 
 ```bash
 scp -P <ssh-port> bin/host-bootstrap.sh <admin>@<ip>:
 ssh -t -p <ssh-port> <admin>@<ip> 'sudo bash host-bootstrap.sh --admin <admin> --projects "<project> <project>"'
 ```
 
-Optional `--docker-journald` makes journald Docker's default log driver (restarts dockerd; containers stay up).
+Optional `--docker-journald` makes journald the default log driver of `deploy`'s daemon (restarts it; containers
+with a restart policy come back).
 
 **3.4 Workstation (agent or human).** Add ssh aliases (`<host>` for the admin, `<host>_deploy` for deploy, both on
 `<ssh-port>`; the port lives only there and in the firewall group, never in this repo), write `hosts/<host>.env` (copy
@@ -102,7 +107,7 @@ Optional `--docker-journald` makes journald Docker's default log driver (restart
 
 ```bash
 bin/proxy-install <host>          # network `proxy`, /srv/proxy, caddy up (no sites yet)
-bin/host-check <host>             # expect: only proxy-caddy-1 publishes ports, 80/443 closed to this machine
+bin/host-check <host>             # expect: rootless docker, only proxy-caddy-1 publishes ports, 80/443 closed to this machine
 ```
 
 ## 4. Add a project to a server
@@ -257,7 +262,7 @@ proxy cannot do (raw TCP, UDP, its own TLS termination) is the exception: write 
 
 ## 9. Open items
 
-- A provider without a firewall in front of the box: Docker-published ports skip ufw, so 80/443 would need
-  `DOCKER-USER` iptables rules limited to Cloudflare. Not built yet; no such server exists.
+- A provider without a firewall in front of the box: rootless Docker's published ports obey ufw, so 80/443 could be
+  limited to Cloudflare's ranges in ufw (serverbeef opens them to everyone). Not built yet; no such server exists.
 - Authenticated Origin Pulls (mTLS from Cloudflare) would also stop traffic sent through someone else's Cloudflare
   account. Not on yet; the IP lock plus Host/SNI matching covers the practical cases.

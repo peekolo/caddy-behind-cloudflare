@@ -7,6 +7,8 @@ H=${1:-}; [[ -n "$H" ]] || die "usage: bin/host-check <host>"
 load_host "$H"
 step "$HOST_NAME ($HOST_TYPE, $HOST_IP) as $HOST_SSH"
 on_host 'echo "  user $(id -un), groups $(id -nG)"; uptime | sed "s/^/  /"'
+on_host "docker info --format '{{.ServerVersion}} {{.SecurityOptions}}' 2>/dev/null" | grep -q rootless \
+  && ok "rootless docker as deploy" || warn "docker is not rootless, or not reachable as deploy"
 step "proxy"
 on_host "cd $PROXY_DIR 2>/dev/null && docker compose ps --format '  {{.Name}}  {{.Status}}' 2>/dev/null || echo '  not installed'"
 on_host "docker network inspect -f '  network {{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}, members: {{range .Containers}}{{.Name}} {{end}}' $PROXY_NET 2>/dev/null || echo '  no proxy network'"
