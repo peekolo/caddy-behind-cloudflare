@@ -83,6 +83,7 @@ changing anything, can be re-run, and takes `--dry-run`.
 |---|---|
 | `bin/host-bootstrap.sh` | Run once as root on a new server: journald retention of 14 days, an unprivileged `deploy` user, `/srv/*` folders |
 | `bin/proxy-install <host>` | Installs or updates the shared Caddy in `/srv/proxy` |
+| `bin/project-add <host> <project>` | Puts a project on a server as `deploy`: a read-only deploy key for its repo (made on the server, you add the public key at GitHub), the checkout in `/srv/<project>`, its `.env`, a check that the compose overlay publishes no ports and joins the proxy network, then `compose up`. Run again to deploy an update |
 | `bin/site-add` | Puts a domain live: Cloudflare Origin CA certificate (key generated on the server), zone settings (Full strict SSL, HTTPS only, TLS 1.2+), the project's Caddy site file (validated, rolled back if Caddy rejects it), proxied DNS records, then checks that the site answers through Cloudflare and that the origin refuses direct connections |
 | `bin/site-remove` | Takes a site off a server, and optionally its DNS records |
 | `bin/host-check <host>` | Read-only server status: proxy health, drift from this repo, certificates, published ports, log retention |
@@ -119,7 +120,8 @@ changing anything, can be re-run, and takes `--dry-run`.
 3. Add SSH aliases for the admin and `deploy` users, copy `hosts/example.env` to `hosts/<name>.env` and fill it in.
 4. `bin/proxy-install <name>`, then `bin/host-check <name>`.
 5. For each project: add a compose overlay that joins the `proxy` network and a Caddy site file to the project's
-   repo, then run `bin/site-add` with `--dry-run` first (runbook section 4).
+   repo, run `bin/project-add <name> <project> --repo <owner>/<repo>`, then `bin/site-add` with `--dry-run` first
+   (runbook section 4).
 
 The full procedure, with the rules for site files, troubleshooting by Cloudflare error code and day-2 tasks, is in
 [CLAUDE.md](CLAUDE.md) (also available as `AGENTS.md`). It is written as instructions for an agent, and people can

@@ -47,7 +47,7 @@ visitor ─▶ Cloudflare edge (TLS, cache, floods) ─▶ provider firewall (80
 | One site file per project | the project's repo (e.g. `deploy/proxy-site.caddy`) -> `/srv/proxy/conf/sites/<project>.caddy` (`bin/site-add`) | the project |
 | Origin CA cert per zone (`<zone>`, `*.<zone>`, 15 years) | `/srv/proxy/certs/<zone>.pem` + `.key` (key made on the box, never leaves it) | `bin/site-add` |
 | Zone settings + DNS | Cloudflare, via the API token | `bin/site-add` |
-| Project stack | `/srv/<project>`, its own compose project | the project |
+| Project stack | `/srv/<project>`, its own compose project: checkout, `.env`, `compose up` | `bin/project-add` (the project owns its compose overlay) |
 
 Upstream headers: Caddy sends `X-Forwarded-For` and `X-Real-IP` with **exactly one address, the visitor's**, and
 `X-Forwarded-Proto: https`. Apps trust those from 10.89.0.0/24 only.
@@ -91,7 +91,8 @@ ssh -t root@<ip> 'bash serverbeef.sh --user <admin> --sudo-password --ssh-port <
 # keep that session open; test `ssh -p <ssh-port> <admin>@<ip>` and `sudo -v` from a new terminal before closing it
 ```
 
-**3.3 Owner, root: bootstrap.** journald 14 days, `deploy`'s SSH keys (same as the admin's) and `/srv/*`:
+**3.3 Owner, root: bootstrap.** journald 14 days, `deploy`'s SSH keys (same as the admin's) and `/srv` (owned by
+`deploy`; `--projects` is optional, `bin/project-add` creates `/srv/<project>` itself):
 
 ```bash
 scp -P <ssh-port> bin/host-bootstrap.sh <admin>@<ip>:
@@ -167,8 +168,9 @@ the registrar. The token covers every zone in the account, so nothing else is ne
   	}
   }
   ```
-- Checkout at `/srv/<project>` as `deploy` (read-only GitHub deploy key per repo). Prefer images built in CI and
-  pulled (`docker compose pull`); a build on a shared box can OOM its neighbours.
+- A `.env.example` listing every variable the stack needs, secrets left empty. `bin/project-add` copies it to
+  `.env` on the box and names the empty keys. Prefer images built in CI and pulled (`bin/project-add --no-build`);
+  a build on a shared box can OOM its neighbours.
 
 **4.3 Certificate and zone settings (any time, even before the project runs).**
 
@@ -180,8 +182,18 @@ Use `--bot-fight off` for zones that serve APIs, MCP, webhooks or other non-brow
 records pointing at other servers, the script stops: Full (strict) is zone-wide, so those origins need valid
 certificates first (`--force-zone` once they do).
 
-**4.4 Start the project** (its own procedure) and check its container is on `proxy`:
-`ssh <host>_deploy "docker network inspect proxy -f '{{range .Containers}}{{.Name}} {{end}}'"`.
+**4.4 Checkout and start** (agent or human; no root):
+
+```bash
+bin/project-add <host> <project> --repo <owner>/<name> [--env <local .env>] [--dry-run]
+```
+
+It makes `deploy`'s read-only key for that repo on the box and prints the public key to add at GitHub
+(Settings > Deploy keys; the owner does that once per repo), clones into `/srv/<project>`, places `.env` (the
+file you pass, else `.env.example` with the empty keys listed; values are never printed) with `COMPOSE_FILE` set
+to the overlay, refuses a config that publishes host ports or joins no `proxy` network, starts the stack and
+checks its containers are on `proxy`. Secrets go in by hand: `ssh -t <host>_deploy nano /srv/<project>/.env`, then
+`bin/project-add <host> <project>` again. The same command is the deploy command from then on (pull, up).
 
 **4.5 Go live:**
 
@@ -204,12 +216,13 @@ up in the app's own log with the visitor's address. `10.89.0.x` there means the 
 |---|---|
 | State of a server | `bin/host-check <host>` |
 | State of a zone | `bin/cf-zone <zone>` |
+| Deploy a project update | `bin/project-add <host> <project>` (git pull --ff-only, compose up -d --build) |
 | Change a project's site file | edit it in the project repo, then `bin/site-add ... --only site,verify` |
 | Change the proxy itself (Caddyfile, snippets, compose) | edit `proxy/` here, `bin/proxy-install <host>` on **every** host in section 2 |
 | Cloudflare changed its IP ranges | `proxy/cloudflare-ips.sh` (writes `proxy/cloudflare.env`), then `bin/proxy-install <host>` per host; update the firewall group if it lists ranges by hand |
 | Add a hostname to a project | add it to the site file, `bin/site-add ... --names "<new name>" --only site,dns,verify` |
-| Take a project off a server | `bin/site-remove --host <host> --project <p> [--zone <z> --names "@ www"]`, then stop its stack |
-| Move a project to another server | bring it up on the new host (section 4, `--only cert,settings,site`), copy data, then `--only dns,verify` there (DNS switches instantly behind Cloudflare), then `bin/site-remove` on the old host |
+| Take a project off a server | `bin/site-remove --host <host> --project <p> [--zone <z> --names "@ www"]`, then `ssh <host>_deploy 'cd /srv/<p> && docker compose down'` and delete the deploy key at GitHub |
+| Move a project to another server | `bin/project-add` on the new host, `site-add --only cert,settings,site`, copy data, then `--only dns,verify` there (DNS switches instantly behind Cloudflare), then `bin/site-remove` on the old host |
 | Certificates | Origin CA certs last 15 years; `site-add` renews one with < 30 days left. Cloudflare must not be grey for the zone while it uses them |
 
 The site file on the box is a copy. Change it in the project repo and re-run `site-add`, never on the box: the next
@@ -238,6 +251,7 @@ cloudflare.token          scoped Cloudflare API token (secret, mode 600, gitigno
 lib/common.sh             shared helpers: host records, ssh, Cloudflare API (token handling)
 bin/host-bootstrap.sh     ROOT, on the box: journald 14 d, deploy user, /srv folders          (section 3.3)
 bin/proxy-install         workstation: install/update /srv/proxy on a host                    (3.4, 5)
+bin/project-add           workstation: deploy key, checkout, .env, compose up, on `proxy`     (4.4, 5)
 bin/site-add              workstation: cert, zone settings, site file, DNS, verify            (4.3, 4.5)
 bin/site-remove           workstation: site file off, optional DNS records removed            (5)
 bin/host-check            workstation: read-only server status                                (everywhere)

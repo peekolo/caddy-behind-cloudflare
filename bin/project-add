@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# project-add: put one project's checkout on a host and start it, as the deploy user (no root). Runs on the
+# workstation. Idempotent: the first run creates, every later run is the deploy command (pull, up).
+#
+#   bin/project-add <host> <project> --repo <owner>/<name> [--env ~/secrets/<project>.env]
+#   bin/project-add <host> <project>                # again: git pull --ff-only, docker compose up -d --build
+#
+# Steps:
+#   key       deploy's own read-only key for this repo on the box (~/.ssh/github-<project>, never leaves it) and
+#             a `Host github-<project>` ssh entry; prints the public key to add at GitHub (Settings > Deploy keys)
+#   checkout  git clone <repo> /srv/<project>, or git pull --ff-only
+#   env       --env FILE is copied to /srv/<project>/.env (mode 600, replaces what is there); without it, an
+#             existing .env is kept, or .env.example is copied and the empty keys are listed, values never printed.
+#             COMPOSE_FILE=<base>:<overlay> is added to .env so a plain `docker compose` uses the overlay
+#   check     `docker compose config` with the overlay: no host ports on any service, at least one service on
+#             the `proxy` network (runbook 4.2); missing mem_limit / journald logging are warned about
+#   up        docker compose up -d --build --remove-orphans (--no-build: pull instead of build)
+#   verify    the project's containers are on `proxy` under the aliases listed in hosts/<host>.env
+#
+# Options: --branch <name>, --overlay <file> (default docker-compose.shared-host.yml), --no-build, --dry-run.
+# Root is never needed: host-bootstrap.sh gave deploy /srv, and the daemon is deploy's own rootless Docker.
+source "$(dirname "$0")/../lib/common.sh"
+need ssh jq
+
+HOSTN='' PROJECT='' REPO='' BRANCH='' ENV_FILE='' OVERLAY=docker-compose.shared-host.yml BUILD=1
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo) REPO=$2; shift 2 ;;        --branch) BRANCH=$2; shift 2 ;;
+    --env) ENV_FILE=$2; shift 2 ;;     --overlay) OVERLAY=$2; shift 2 ;;
+    --no-build) BUILD=0; shift ;;      --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -*) die "unknown option $1 (see --help)" ;;
+    *) if [[ -z "$HOSTN" ]]; then HOSTN=$1; elif [[ -z "$PROJECT" ]]; then PROJECT=$1; else die "unexpected argument $1"; fi; shift ;;
+  esac
+done
+[[ -n "$HOSTN" && -n "$PROJECT" ]] || die "usage: bin/project-add <host> <project> [--repo owner/name] (see --help)"
+[[ "$PROJECT" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "project must be lowercase letters, digits, dashes"
+[[ -z "$REPO" || "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repo must be <owner>/<name> (a GitHub repository)"
+[[ -z "$ENV_FILE" || -f "$ENV_FILE" ]] || die "no such file: $ENV_FILE"
+[[ "$OVERLAY" =~ ^[A-Za-z0-9_.-]+$ ]] || die "--overlay is a file name inside the checkout"
+load_host "$HOSTN"
+[[ "$DRY_RUN" == 1 ]] && warn "dry run: nothing will change"
+DIR=/srv/$PROJECT
+GH=github-$PROJECT                      # ssh host alias on the box, and the key file name under ~/.ssh
+KEY=.ssh/$GH                            # relative to deploy's home, where every on_host command starts
+HOST_PROJECTS=$(sed -nE 's/^PROJECTS=([^#]*).*/\1/p' "$AIDEPLOY/hosts/$HOSTN.env" | tr -d '"')
+HOST_ALIASES=$(sed -nE 's/^ALIASES=([^#]*).*/\1/p' "$AIDEPLOY/hosts/$HOSTN.env" | tr -d '"')
+# GitHub's published SSH host keys (https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)
+GITHUB_HOST_KEY='github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl'
+
+step "preflight: $PROJECT on $HOST_NAME ($HOST_IP) as deploy"
+on_host "docker info --format '{{.SecurityOptions}}' 2>/dev/null" | grep -q rootless \
+  || die "deploy on $HOST_NAME has no rootless Docker daemon (serverbeef --docker --docker-user deploy, then bin/host-bootstrap.sh)"
+on_host "docker network inspect $PROXY_NET >/dev/null 2>&1" || die "network $PROXY_NET missing (run bin/proxy-install $HOSTN first)"
+if on_host "test -d $DIR"; then
+  on_host "test -w $DIR" || die "$DIR exists but deploy cannot write it (re-run bin/host-bootstrap.sh)"
+  ok "$DIR exists"
+elif on_host "test -w /srv"; then
+  if act "mkdir $DIR"; then on_host "install -d -m 2775 $DIR"; ok "created $DIR"; fi
+else
+  die "deploy cannot create $DIR: re-run bin/host-bootstrap.sh (it hands /srv to deploy), or add --projects $PROJECT"
+fi
+grep -qw "$PROJECT" <<<"$HOST_PROJECTS" || warn "$PROJECT is not in PROJECTS= of hosts/$HOSTN.env: add it, and the host table row"
+if [[ -z "$REPO" ]]; then
+  url=$(on_host "git -C $DIR remote get-url origin 2>/dev/null" || true)
+  [[ "$url" == "$GH:"*.git ]] || die "no checkout in $DIR yet: pass --repo <owner>/<name>"
+  REPO=${url#"$GH:"}; REPO=${REPO%.git}
+fi
+ok "repository $REPO"
+
+# ---------------------------------------------------------------------------------------------------------------
+step "key: deploy's read-only key for $REPO"
+if on_host "test -f $KEY"; then ok "deploy has $KEY"
+elif act "ssh-keygen ed25519 $KEY on the box (the private key never leaves it)"; then
+  on_host "umask 077 && mkdir -p .ssh && ssh-keygen -q -t ed25519 -N '' -C 'deploy@$HOST_NAME $REPO' -f $KEY"; ok generated
+fi
+if on_host "grep -qs '^Host $GH\$' .ssh/config"; then ok "ssh config: Host $GH"
+elif act "add Host $GH to deploy's .ssh/config"; then
+  on_host "umask 077 && printf '\nHost $GH\n  HostName github.com\n  User git\n  IdentityFile ~/$KEY\n  IdentitiesOnly yes\n' >> .ssh/config"; ok added
+fi
+if on_host "grep -qsF '$GITHUB_HOST_KEY' .ssh/known_hosts"; then ok "github.com host key known"
+elif act "pin github.com's ed25519 host key in deploy's known_hosts"; then
+  on_host "umask 077 && printf '%s\n' '$GITHUB_HOST_KEY' >> .ssh/known_hosts"; ok pinned
+fi
+gh_auth() { on_host "ssh -o BatchMode=yes -o ConnectTimeout=15 -T $GH 2>&1" || true; }
+if [[ "$DRY_RUN" == 1 ]] && ! on_host "test -f $KEY"; then
+  skip "no key yet, so GitHub access cannot be tested"
+else
+  greeting=$(gh_auth)
+  until grep -q "successfully authenticated" <<<"$greeting"; do
+    printf '\n  Add this key at https://github.com/%s/settings/keys/new  (title: deploy@%s, read-only):\n\n    %s\n\n' \
+      "$REPO" "$HOST_NAME" "$(on_host "cat $KEY.pub")"
+    [[ -t 0 ]] || die "GitHub does not accept the key yet; add it, then re-run"
+    read -r -p "  Press Enter when it is added (Ctrl-C to stop) " _
+    greeting=$(gh_auth)
+  done
+  granted=$(sed -nE 's/^Hi ([^!]+)!.*/\1/p' <<<"$greeting")
+  if [[ "$granted" == "$REPO" ]]; then ok "GitHub accepts the key for $REPO"
+  else warn "GitHub greets the key as '$granted', not as a deploy key of $REPO (it works if that account can read the repo)"; fi
+fi
+
+# ---------------------------------------------------------------------------------------------------------------
+step "checkout: $DIR"
+if on_host "test -d $DIR/.git"; then
+  url=$(on_host "git -C $DIR remote get-url origin")
+  [[ "$url" == "$GH:$REPO.git" ]] || die "$DIR tracks $url, not $GH:$REPO.git"
+  if [[ -n "$BRANCH" ]] && [[ "$(on_host "git -C $DIR rev-parse --abbrev-ref HEAD")" != "$BRANCH" ]]; then
+    if act "git checkout $BRANCH"; then on_host "git -C $DIR checkout -q $BRANCH"; fi
+  fi
+  if act "git pull --ff-only"; then
+    before=$(on_host "git -C $DIR rev-parse --short HEAD")
+    on_host "git -C $DIR pull -q --ff-only"
+    after=$(on_host "git -C $DIR rev-parse --short HEAD")
+    if [[ "$before" == "$after" ]]; then ok "already at $after"; else ok "$before -> $after"; fi
+  fi
+else
+  on_host "[ -z \"\$(ls -A $DIR)\" ]" || die "$DIR is not empty and not a git checkout: move its contents aside first"
+  if act "git clone $GH:$REPO.git $DIR${BRANCH:+ (branch $BRANCH)}"; then
+    on_host "git clone -q ${BRANCH:+--branch $BRANCH }$GH:$REPO.git $DIR"; ok "cloned $(on_host "git -C $DIR rev-parse --short HEAD")"
+  fi
+fi
+on_host "test -d $DIR/.git" || { skip "no checkout yet (dry run); env, check, up and verify need one"; exit 0; }
+BASE=$(on_host "cd $DIR && for f in compose.yaml compose.yml docker-compose.yml docker-compose.yaml; do [ -f \$f ] && echo \$f && break; done" || true)
+[[ -n "$BASE" ]] || die "no compose file in $DIR"
+on_host "test -f $DIR/$OVERLAY" || die "$DIR/$OVERLAY missing: the project needs an overlay for this host (runbook section 4.2)"
+ok "compose files $BASE + $OVERLAY"
+
+# ---------------------------------------------------------------------------------------------------------------
+step "env: $DIR/.env"
+if [[ -n "$ENV_FILE" ]]; then
+  if on_host "test -f $DIR/.env" && on_host "cat $DIR/.env" | cmp -s - "$ENV_FILE"; then ok ".env is identical to $ENV_FILE"
+  elif act "copy $ENV_FILE -> $DIR/.env (mode 600, replaces the current one)"; then
+    on_host "umask 077 && cat > $DIR/.env.new && mv $DIR/.env.new $DIR/.env" < "$ENV_FILE"; ok copied
+  fi
+elif on_host "test -f $DIR/.env"; then ok ".env kept"
+elif on_host "test -f $DIR/.env.example"; then
+  if act "copy .env.example -> .env (mode 600)"; then on_host "umask 077 && cp $DIR/.env.example $DIR/.env"; ok "created from .env.example"; fi
+else
+  if act "create an empty .env (mode 600)"; then on_host "umask 077 && : > $DIR/.env"; ok created; fi
+fi
+if on_host "test -f $DIR/.env"; then
+  if on_host "grep -q '^COMPOSE_FILE=' $DIR/.env"; then
+    if on_host "grep -q '^COMPOSE_FILE=.*$OVERLAY' $DIR/.env"; then ok "COMPOSE_FILE uses $OVERLAY"
+    else warn "COMPOSE_FILE in .env does not use $OVERLAY: $(on_host "grep '^COMPOSE_FILE=' $DIR/.env")"; fi
+  elif act "append COMPOSE_FILE=$BASE:$OVERLAY to .env"; then
+    on_host "printf '\n# added by aideploy project-add: the overlay for this host (runbook 4.2)\nCOMPOSE_FILE=$BASE:$OVERLAY\n' >> $DIR/.env"; ok appended
+  fi
+  empty=$(on_host "grep -oE '^[A-Za-z_][A-Za-z0-9_]*=\$' $DIR/.env | tr -d = | tr '\n' ' '" || true)
+  [[ -z "$empty" ]] || warn "empty values in .env: ${empty}(ssh -t $HOST_SSH nano $DIR/.env, or edit a local copy and re-run with --env)"
+fi
+
+# ---------------------------------------------------------------------------------------------------------------
+step "check: compose config with the overlay"
+cfg=$(on_host "cd $DIR && COMPOSE_FILE=$BASE:$OVERLAY docker compose config --format json 2>&1") || die "docker compose config failed:
+$cfg"
+published=$(jq -r '.services | to_entries[] | select((.value.ports // []) | length > 0) | .key' <<<"$cfg")
+[[ -z "$published" ]] || die "these services publish host ports, which only the proxy may do (set ports: !reset [] in $OVERLAY): $published"
+on_proxy=$(jq -r --arg n "$PROXY_NET" '.services | to_entries[] | select(.value.networks[$n]?) | "\(.key) as \(.value.networks[$n].aliases // [] | join(","))"' <<<"$cfg")
+[[ -n "$on_proxy" ]] || die "no service joins the network $PROXY_NET (runbook 4.2): the proxy could not reach the app"
+ok "no host ports; on $PROXY_NET: $(tr '\n' ';' <<<"$on_proxy" | sed 's/;$//; s/;/; /g')"
+for name in $(jq -r '.services | to_entries[] | select(.value.mem_limit == null) | .key' <<<"$cfg"); do warn "service $name has no mem_limit"; done
+for name in $(jq -r '.services | to_entries[] | select((.value.logging.driver // "") != "journald") | .key' <<<"$cfg"); do warn "service $name does not log to journald"; done
+for alias in $(jq -r --arg n "$PROXY_NET" '.services[] | .networks[$n].aliases // [] | .[]' <<<"$cfg"); do
+  grep -qE "(^| )$alias:" <<<"$HOST_ALIASES" || warn "alias $alias is not in ALIASES= of hosts/$HOSTN.env (must be unique on the host)"
+done
+
+# ---------------------------------------------------------------------------------------------------------------
+step "up"
+if [[ $BUILD == 1 ]]; then cmd="docker compose up -d --build --remove-orphans"; else cmd="docker compose pull -q && docker compose up -d --remove-orphans"; fi
+if act "$cmd"; then on_host "cd $DIR && $cmd" 2>&1 | grep -vE '^\s*$' | sed 's/^/       /'; fi
+on_host "cd $DIR && docker compose ps --format '{{.Name}}\t{{.Status}}'" | sed 's/^/       /'
+
+# ---------------------------------------------------------------------------------------------------------------
+step "verify: on $PROXY_NET"
+members=$(on_host "docker network inspect $PROXY_NET -f '{{range .Containers}}{{.Name}} {{end}}'")
+missing=0
+for svc in $(jq -r --arg n "$PROXY_NET" '.services | to_entries[] | select(.value.networks[$n]?) | .key' <<<"$cfg"); do
+  cname=$(jq -r --arg s "$svc" '.services[$s].container_name // empty' <<<"$cfg")   # else compose names it <project>-<svc>-<n>
+  if grep -qE "(^| )${cname:-$PROJECT-$svc-[0-9]+}( |$)" <<<"$members"; then ok "${cname:-$PROJECT-$svc} on $PROXY_NET"
+  else warn "${cname:-$PROJECT-$svc} is not on $PROXY_NET (not started?)"; missing=1; fi
+done
+[[ $missing == 0 ]] || [[ "$DRY_RUN" == 1 ]] || die "the proxy cannot reach $PROJECT yet"
+echo; echo "Next: bin/site-add --host $HOSTN --zone <zone> --project $PROJECT --site-file <repo>/deploy/proxy-site.caddy --names \"@ www\" --dry-run"
+echo "Deploy an update later: bin/project-add $HOSTN $PROJECT"

@@ -11,7 +11,8 @@
 # repeat any of that. It adds:
 #   1. journald: no log entry older than 14 days (overrides serverbeef's 1 month), one file per day
 #   2. the `deploy` user's SSH keys (same as the admin's) and ssh-users group; NO sudo, NO docker group
-#   3. /srv/proxy and /srv/<project> per project, owned by deploy, group-writable (setgid)
+#   3. /srv owned by deploy (so bin/project-add can add projects later without root), /srv/proxy and
+#      /srv/<project> per --projects, group-writable (setgid)
 #   4. optional --docker-journald: journald as the default log driver of deploy's daemon (restarts it; containers
 #      with a restart policy come back)
 set -Eeuo pipefail
@@ -20,7 +21,7 @@ ADMIN="" PROJECTS="" DOCKER_JOURNALD=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --admin) ADMIN=$2; shift 2 ;;
-    --projects) PROJECTS=$2; shift 2 ;;
+    --projects) PROJECTS=$2; shift 2 ;;       # optional: bin/project-add creates /srv/<project> too
     --docker-journald) DOCKER_JOURNALD=1; shift ;;
     -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 1 ;;
@@ -77,6 +78,7 @@ else
 fi
 
 echo "== 3. /srv folders"
+install -d -m 2775 -o deploy -g deploy /srv
 for d in proxy $PROJECTS backups; do
   install -d -m 2775 -o deploy -g deploy "/srv/$d"
 done
