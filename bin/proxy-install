@@ -30,9 +30,18 @@ else
   printf '%s\n' "$changes" | sed 's/^/       /'
   if act "rsync proxy/ -> $PROXY_DIR"; then "${RS[@]}" "$AIDEPLOY/proxy/" "$HOST_SSH:$PROXY_DIR/" >/dev/null; ok synced; fi
 fi
-if on_host "test -f $PROXY_DIR/.env"; then ok ".env kept"
-elif act "create .env (LOCAL_RANGES: proxy gateway + the box's default gateway, what a local smoke check looks like)"; then
-  on_host "cd $PROXY_DIR && gw=\$(ip -4 route show default | awk '{print \$3; exit}') && sed \"s#^LOCAL_RANGES=.*#LOCAL_RANGES=10.89.0.1/32\${gw:+ \$gw/32}#\" .env.example > .env && chmod 640 .env"; ok ".env created"
+# A smoke check on the box (curl --resolve <host>:443:127.0.0.1) reaches caddy from the proxy gateway (rootful) or,
+# through rootless Docker's pasta, from rootlesskit's namespace address 10.0.2.100 (measured on two serverbeef hosts, 2026-10-23).
+ROOTLESS_LOCAL=10.0.2.100/32
+if on_host "test -f $PROXY_DIR/.env"; then
+  ok ".env kept"
+  if on_host "docker info --format '{{.SecurityOptions}}'" | grep -q rootless && ! on_host "grep -q '^LOCAL_RANGES=.*$ROOTLESS_LOCAL' $PROXY_DIR/.env"; then
+    if act "add $ROOTLESS_LOCAL (rootless loopback) to LOCAL_RANGES in .env"; then
+      on_host "cd $PROXY_DIR && sed -i 's#^LOCAL_RANGES=.*#& $ROOTLESS_LOCAL#' .env"; ok "LOCAL_RANGES: $(on_host "sed -n 's/^LOCAL_RANGES=//p' $PROXY_DIR/.env")"
+    fi
+  fi
+elif act "create .env (LOCAL_RANGES: proxy gateway + rootless loopback, what a local smoke check looks like)"; then
+  on_host "cd $PROXY_DIR && sed 's#^LOCAL_RANGES=.*#LOCAL_RANGES=10.89.0.1/32 $ROOTLESS_LOCAL#' .env.example > .env && chmod 640 .env"; ok ".env created"
 fi
 
 step "4. start / update caddy"
