@@ -192,7 +192,7 @@ It makes `deploy`'s read-only key for that repo on the box and prints the public
 (Settings > Deploy keys; the owner does that once per repo), clones into `~/srv/<project>`, places `.env` (the
 file you pass, else `.env.example` with the empty keys listed; values are never printed) with `COMPOSE_FILE` set
 to the overlay, refuses a config that publishes host ports or joins no `proxy` network, starts the stack and
-checks its containers are on `proxy`. Secrets go in by hand: `ssh -t <host>_deploy nano srv/<project>/.env`, then
+checks its containers are on `proxy` (with `UP` in `aideploy.env`, that command replaces `compose up`; section 4.2). Secrets go in by hand: `ssh -t <host>_deploy nano srv/<project>/.env`, then
 `bin/project-add <host> <project>` again. The same command is the deploy command from then on (pull, up).
 
 **4.5 Go live:**
@@ -223,6 +223,7 @@ up in the app's own log with the visitor's address. `10.89.0.x` there means the 
 | Add a hostname to a project | add it to the site file, `bin/site-add ... --names "<new name>" --only site,dns,verify` |
 | Take a project off a server | `bin/site-remove --host <host> --project <p> [--zone <z> --names "@ www"]`, then `ssh <host>_deploy 'cd srv/<p> && docker compose down'` and delete the deploy key at GitHub |
 | Move a project to another server | `bin/project-add` on the new host, `site-add --only cert,settings,site`, copy data, then `--only dns,verify` there (DNS switches instantly behind Cloudflare), then `bin/site-remove` on the old host |
+| Rebuild a server (reinstall) | Before the wipe: list what runs (`docker ps -a`, `~/srv/*`, volumes, crontab), check databases for real rows, copy each project's `.env` and any untracked runtime files (gate/tester lists, uploads) to the workstation (mode 600); never copy cert keys. Reinstall, serverbeef (section 3), `proxy-install`, `site-add --only cert,settings` per zone, `project-add` per project (new deploy keys: delete the old ones at GitHub), `site-add` site/dns/verify, then revoke the old Origin CA certs in Cloudflare (`cf-zone` lists them) |
 | Certificates | Origin CA certs last 15 years; `site-add` renews one with < 30 days left. Cloudflare must not be grey for the zone while it uses them |
 
 The site file on the box is a copy. Change it in the project repo and re-run `site-add`, never on the box: the next
@@ -237,6 +238,7 @@ The site file on the box is a copy. Change it in the project repo and re-run `si
 | 525 / 526 | TLS to origin failed | no site file for that name, or cert missing / wrong zone in `import cloudflare_origin` |
 | 502 | proxy fine, app not reachable | project not up, or not on `proxy` with that alias |
 | 524 | app silent for 100 s | make it stream keep-alives or run the work as a job |
+| every on-box smoke check `000` / HTTP/2 INTERNAL_ERROR | Caddy aborted a local request: under rootless Docker (pasta) `curl --resolve <host>:443:127.0.0.1` arrives from `10.0.2.100` | `LOCAL_RANGES` in `~/srv/proxy/.env`; `bin/proxy-install <host>` adds it |
 | reload refused | a site file is invalid | `ssh <host>_deploy srv/proxy/reload.sh` prints the file and line; one broken file blocks every reload on the host |
 | app logs one IP for everyone | app does not trust 10.89.0.0/24, or reads the wrong header | section 4.2 |
 

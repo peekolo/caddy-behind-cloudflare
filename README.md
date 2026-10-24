@@ -82,7 +82,7 @@ the current state before changing anything, can be re-run, and takes `--dry-run`
 | Script | Does |
 |---|---|
 | `bin/proxy-install <host>` | Installs or updates the shared Caddy in `~/srv/proxy` |
-| `bin/project-add <host> <project>` | Puts a project on a server as `deploy`: a read-only deploy key for its repo (made on the server, you add the public key at GitHub), the checkout in `~/srv/<project>`, its `.env`, a check that the compose overlay publishes no ports and joins the proxy network, then `compose up`. Run again to deploy an update |
+| `bin/project-add <host> <project>` | Puts a project on a server as `deploy`: a read-only deploy key for its repo (made on the server, you add the public key at GitHub), the checkout in `~/srv/<project>`, its `.env`, a check that the compose overlay publishes no ports and joins the proxy network, then `compose up`, or the project's own release script when its repo has an `aideploy.env` (a stack in a subdirectory, a deploy script with migrations and rollback). Run again to deploy an update |
 | `bin/site-add` | Puts a domain live: Cloudflare Origin CA certificate (key generated on the server), zone settings (Full strict SSL, HTTPS only, TLS 1.2+), the project's Caddy site file (validated, rolled back if Caddy rejects it), proxied DNS records, then checks that the site answers through Cloudflare and that the origin refuses direct connections |
 | `bin/site-remove` | Takes a site off a server, and optionally its DNS records |
 | `bin/host-check <host>` | Read-only server status: proxy health, drift from this repo, certificates, published ports, log retention |
