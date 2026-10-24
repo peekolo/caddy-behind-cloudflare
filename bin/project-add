@@ -57,8 +57,11 @@ elif act "mkdir $DIR in deploy's home"; then on_host "install -d -m 755 $DIR"; o
 grep -qw "$PROJECT" <<<"$HOST_PROJECTS" || warn "$PROJECT is not in PROJECTS= of hosts/$HOSTN.env: add it, and the host table row"
 if [[ -z "$REPO" ]]; then
   url=$(on_host "git -C $DIR remote get-url origin 2>/dev/null" || true)
-  [[ "$url" == "$GH:"*.git ]] || die "no checkout in $DIR yet: pass --repo <owner>/<name>"
-  REPO=${url#"$GH:"}; REPO=${REPO%.git}
+  if [[ "$url" == "$GH:"*.git ]]; then REPO=${url#"$GH:"}; REPO=${REPO%.git}
+  else   # not cloned yet (the first run stopped at the GitHub key step): the key's comment names the repository
+    REPO=$(on_host "awk '{print \$NF}' $KEY.pub 2>/dev/null" || true)
+    [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "no checkout in $DIR yet: pass --repo <owner>/<name>"
+  fi
 fi
 ok "repository $REPO"
 
