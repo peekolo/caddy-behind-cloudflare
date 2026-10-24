@@ -4,7 +4,8 @@ set -Eeuo pipefail
 AIDEPLOY="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROXY_NET=proxy
 PROXY_SUBNET=10.89.0.0/24
-PROXY_DIR=/srv/proxy
+SRV_DIR=srv                 # under deploy's home: ~/srv/proxy, ~/srv/<project>. deploy makes it; no root anywhere
+PROXY_DIR=$SRV_DIR/proxy
 DRY_RUN=${DRY_RUN:-0}
 
 if [[ -t 1 ]]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'; else B= G= Y= R= N=; fi

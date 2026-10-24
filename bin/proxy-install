@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# proxy-install <host> [--dry-run]: install or update the shared Caddy in /srv/proxy on a host, from this repo's proxy/.
+# proxy-install <host> [--dry-run]: install or update the shared Caddy in ~/srv/proxy (deploy's home) on a host, from this repo's proxy/.
 # Runs on the workstation, connects as the deploy user. Idempotent. Never touches project-owned files:
 # conf/sites/*.caddy, certs/*, .env (created once from .env.example with the box's gateway in LOCAL_RANGES).
 source "$(dirname "$0")/../lib/common.sh"
@@ -10,9 +10,9 @@ load_host "$H"
 
 step "1. reach $HOST_SSH as deploy"
 on_host "docker info --format '{{.SecurityOptions}}' 2>/dev/null" | grep -q rootless \
-  || die "deploy on $HOST_NAME has no rootless Docker daemon (serverbeef --docker, then bin/host-bootstrap.sh)"
-on_host "test -d $PROXY_DIR -a -w $PROXY_DIR" || die "$PROXY_DIR missing or not writable (run bin/host-bootstrap.sh)"
-ok "deploy@$HOST_NAME, rootless Docker, $PROXY_DIR writable"
+  || die "deploy on $HOST_NAME has no rootless Docker daemon (serverbeef with Docker, rootless, run by deploy)"
+if on_host "test -d $PROXY_DIR"; then ok "deploy@$HOST_NAME, rootless Docker, ~/$PROXY_DIR exists"
+elif act "mkdir ~/$PROXY_DIR as deploy"; then on_host "install -d -m 755 $PROXY_DIR"; ok "deploy@$HOST_NAME, rootless Docker, ~/$PROXY_DIR created"; fi
 
 step "2. network $PROXY_NET ($PROXY_SUBNET)"
 have=$(on_host "docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' $PROXY_NET 2>/dev/null" || true)

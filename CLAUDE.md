@@ -17,7 +17,7 @@ Docker will do).
    a credential that can change DNS.
 2. **Orange cloud everywhere.** Every public hostname is proxied by Cloudflare (SSL "Full (strict)"). The origin IP
    is never published in DNS as grey/DNS-only, not even briefly (DNS history keeps it forever).
-3. **One front door per server: the shared Caddy in `/srv/proxy`.** It is the only container that publishes host
+3. **One front door per server: the shared Caddy in `~/srv/proxy`** (deploy's home). It is the only container that publishes host
    ports (80, 443). Projects never publish ports; they join the Docker network `proxy` (10.89.0.0/24) under a
    unique alias. This is true on individual servers too (section 8).
 4. **Origin lock, twice.** The provider firewall admits 80/443 from Cloudflare only (the layer that does not depend
@@ -25,8 +25,9 @@ Docker will do).
    Cloudflare's ranges. A request that reaches an app came through Cloudflare.
 5. **Two users, root behind a password.** The admin user (from serverbeef, sudo with a password only the owner
    knows) does root steps only. Everything else runs as `deploy`: its own rootless Docker daemon, **no sudo, no
-   docker group**, owns `/srv/*`. Agents never have sudo, and nothing they do through Docker can reach root.
-6. **Logs live 14 days at most** (journald, host-wide). Containers log to journald.
+   docker group**, and everything lives in its home: `~/srv/proxy`, `~/srv/<project>`. After serverbeef, nothing in
+   this runbook needs root: agents never have sudo, and nothing they do through Docker can reach root.
+6. **Logs go to journald**, which the host rotates (serverbeef keeps a month). Containers log to journald.
 7. **Order that never breaks a live site:** certificate -> zone settings -> project up on `proxy` -> site file
    -> DNS -> verify. `bin/site-add` runs exactly that.
 8. After any change: `bin/host-check <host>`, and update the host's row in the host table (section 2) if anything
@@ -36,18 +37,18 @@ Docker will do).
 
 ```
 visitor ─▶ Cloudflare edge (TLS, cache, floods) ─▶ provider firewall (80/443 from Cloudflare only)
-        ─▶ /srv/proxy: caddy (Origin CA cert per zone, CF-Connecting-IP -> client_ip, drops non-Cloudflare)
-        ─▶ network `proxy` 10.89.0.0/24 ─▶ <alias>:<port> of each project (its own compose project in /srv/<project>)
+        ─▶ ~/srv/proxy: caddy (Origin CA cert per zone, CF-Connecting-IP -> client_ip, drops non-Cloudflare)
+        ─▶ network `proxy` 10.89.0.0/24 ─▶ <alias>:<port> of each project (its own compose project in ~/srv/<project>)
                                            databases etc. stay on the project's own networks, never on `proxy`
 ```
 
 | Piece | Where | Owner |
 |---|---|---|
-| Proxy compose, main Caddyfile, snippets, Cloudflare ranges | `proxy/` here -> `/srv/proxy` (`bin/proxy-install`) | this repo |
-| One site file per project | the project's repo (e.g. `deploy/proxy-site.caddy`) -> `/srv/proxy/conf/sites/<project>.caddy` (`bin/site-add`) | the project |
-| Origin CA cert per zone (`<zone>`, `*.<zone>`, 15 years) | `/srv/proxy/certs/<zone>.pem` + `.key` (key made on the box, never leaves it) | `bin/site-add` |
+| Proxy compose, main Caddyfile, snippets, Cloudflare ranges | `proxy/` here -> `~/srv/proxy` (`bin/proxy-install`) | this repo |
+| One site file per project | the project's repo (e.g. `deploy/proxy-site.caddy`) -> `~/srv/proxy/conf/sites/<project>.caddy` (`bin/site-add`) | the project |
+| Origin CA cert per zone (`<zone>`, `*.<zone>`, 15 years) | `~/srv/proxy/certs/<zone>.pem` + `.key` (key made on the box, never leaves it) | `bin/site-add` |
 | Zone settings + DNS | Cloudflare, via the API token | `bin/site-add` |
-| Project stack | `/srv/<project>`, its own compose project: checkout, `.env`, `compose up` | `bin/project-add` (the project owns its compose overlay) |
+| Project stack | `~/srv/<project>`, its own compose project: checkout, `.env`, `compose up` | `bin/project-add` (the project owns its compose overlay) |
 
 Upstream headers: Caddy sends `X-Forwarded-For` and `X-Real-IP` with **exactly one address, the visitor's**, and
 `X-Forwarded-Proto: https`. Apps trust those from 10.89.0.0/24 only.
@@ -81,7 +82,7 @@ nothing else. No IPv6 unless you plan for it (then AAAA records and the IPv6 ran
 
 **3.2 Owner: serverbeef.** On the workstation, `bash ../serverbeef/serverbeef-local.sh` makes the admin key (passphrase)
 and the deploy key (none), writes the ssh aliases `<host>` and `<host>_deploy`, and uploads `serverbeef.sh` with
-the answers (admin name, port, both public keys) to root on the fresh box. Then, as root on the box,
+the answers (admin name, port, hostname, both public keys) to the fresh box with the provider's login. Then, as root on the box,
 `serverbeef.sh` hardens it (SSH on `<ssh-port>`, key-only, ufw, fail2ban, unattended upgrades, swap), creates the
 admin (sudo behind a password only the owner knows, the default) and `deploy` (its own key, no sudo, no password)
 and installs rootless Docker running as `deploy`:
@@ -92,25 +93,14 @@ ssh -t root@<ip> 'bash serverbeef.sh --config serverbeef-<host>.conf'   # on the
 # keep that session open; test `ssh <host>` and `sudo -v` from a new terminal before closing it
 ```
 
-**3.3 Owner, root: bootstrap.** journald 14 days, a check of `deploy` (its own key, no sudo) and `/srv` (owned by
-`deploy`; `--projects` is optional, `bin/project-add` creates `/srv/<project>` itself):
+That was the last root step. Everything below runs as `deploy` from the workstation.
 
-```bash
-scp -P <ssh-port> bin/host-bootstrap.sh <admin>@<ip>:
-ssh -t -p <ssh-port> <admin>@<ip> 'sudo bash host-bootstrap.sh'      # asks: admin user, projects, journald; then a yes
-```
-
-Without options it asks (defaults: the user who ran sudo, no projects, journald on). The admin's keys are never
-copied to `deploy`: the two accounts have different keys on purpose. For an unattended run pass
-`--admin <admin> [--projects "<project> <project>"] [--docker-journald]`; `--docker-journald` makes journald the
-default log driver of `deploy`'s daemon (restarts it; containers with a restart policy come back).
-
-**3.4 Workstation (agent or human).** The ssh aliases (`<host>` for the admin, `<host>_deploy` for deploy, both on
+**3.3 Workstation (agent or human).** The ssh aliases (`<host>` for the admin, `<host>_deploy` for deploy, both on
 `<ssh-port>`) exist since 3.2; the port lives only there and in the firewall group, never in this repo. Write `hosts/<host>.env` (copy
 `hosts/example.env`), add the row to the host table (section 2), then:
 
 ```bash
-bin/proxy-install <host>          # network `proxy`, /srv/proxy, caddy up (no sites yet)
+bin/proxy-install <host>          # network `proxy`, ~/srv/proxy, caddy up (no sites yet)
 bin/host-check <host>             # expect: rootless docker, only proxy-caddy-1 publishes ports, 80/443 closed to this machine
 ```
 
@@ -192,10 +182,10 @@ bin/project-add <host> <project> --repo <owner>/<name> [--env <local .env>] [--d
 ```
 
 It makes `deploy`'s read-only key for that repo on the box and prints the public key to add at GitHub
-(Settings > Deploy keys; the owner does that once per repo), clones into `/srv/<project>`, places `.env` (the
+(Settings > Deploy keys; the owner does that once per repo), clones into `~/srv/<project>`, places `.env` (the
 file you pass, else `.env.example` with the empty keys listed; values are never printed) with `COMPOSE_FILE` set
 to the overlay, refuses a config that publishes host ports or joins no `proxy` network, starts the stack and
-checks its containers are on `proxy`. Secrets go in by hand: `ssh -t <host>_deploy nano /srv/<project>/.env`, then
+checks its containers are on `proxy`. Secrets go in by hand: `ssh -t <host>_deploy nano srv/<project>/.env`, then
 `bin/project-add <host> <project>` again. The same command is the deploy command from then on (pull, up).
 
 **4.5 Go live:**
@@ -224,12 +214,12 @@ up in the app's own log with the visitor's address. `10.89.0.x` there means the 
 | Change the proxy itself (Caddyfile, snippets, compose) | edit `proxy/` here, `bin/proxy-install <host>` on **every** host in section 2 |
 | Cloudflare changed its IP ranges | `proxy/cloudflare-ips.sh` (writes `proxy/cloudflare.env`), then `bin/proxy-install <host>` per host; update the firewall group if it lists ranges by hand |
 | Add a hostname to a project | add it to the site file, `bin/site-add ... --names "<new name>" --only site,dns,verify` |
-| Take a project off a server | `bin/site-remove --host <host> --project <p> [--zone <z> --names "@ www"]`, then `ssh <host>_deploy 'cd /srv/<p> && docker compose down'` and delete the deploy key at GitHub |
+| Take a project off a server | `bin/site-remove --host <host> --project <p> [--zone <z> --names "@ www"]`, then `ssh <host>_deploy 'cd srv/<p> && docker compose down'` and delete the deploy key at GitHub |
 | Move a project to another server | `bin/project-add` on the new host, `site-add --only cert,settings,site`, copy data, then `--only dns,verify` there (DNS switches instantly behind Cloudflare), then `bin/site-remove` on the old host |
 | Certificates | Origin CA certs last 15 years; `site-add` renews one with < 30 days left. Cloudflare must not be grey for the zone while it uses them |
 
 The site file on the box is a copy. Change it in the project repo and re-run `site-add`, never on the box: the next
-`site-add` would overwrite a hand edit. Old versions are kept in `/srv/proxy/sites-backup/`.
+`site-add` would overwrite a hand edit. Old versions are kept in `~/srv/proxy/sites-backup/`.
 
 ## 6. Troubleshooting
 
@@ -240,10 +230,10 @@ The site file on the box is a copy. Change it in the project repo and re-run `si
 | 525 / 526 | TLS to origin failed | no site file for that name, or cert missing / wrong zone in `import cloudflare_origin` |
 | 502 | proxy fine, app not reachable | project not up, or not on `proxy` with that alias |
 | 524 | app silent for 100 s | make it stream keep-alives or run the work as a job |
-| reload refused | a site file is invalid | `ssh <host>_deploy /srv/proxy/reload.sh` prints the file and line; one broken file blocks every reload on the host |
+| reload refused | a site file is invalid | `ssh <host>_deploy srv/proxy/reload.sh` prints the file and line; one broken file blocks every reload on the host |
 | app logs one IP for everyone | app does not trust 10.89.0.0/24, or reads the wrong header | section 4.2 |
 
-Logs: `ssh <host>_deploy 'cd /srv/proxy && docker compose logs --since 10m caddy'`; access lines carry
+Logs: `ssh <host>_deploy 'cd srv/proxy && docker compose logs --since 10m caddy'`; access lines carry
 `request.client_ip` (visitor) and `request.remote_ip` (Cloudflare edge).
 
 ## 7. Files here
@@ -252,14 +242,13 @@ Logs: `ssh <host>_deploy 'cd /srv/proxy && docker compose logs --since 10m caddy
 CLAUDE.md (= AGENTS.md)   this runbook (README.md: overview for people, LICENSE: MIT)
 cloudflare.token          scoped Cloudflare API token (secret, mode 600, gitignored)
 lib/common.sh             shared helpers: host records, ssh, Cloudflare API (token handling)
-bin/host-bootstrap.sh     ROOT, on the box: journald 14 d, deploy user, /srv folders          (section 3.3)
-bin/proxy-install         workstation: install/update /srv/proxy on a host                    (3.4, 5)
+bin/proxy-install         workstation: install/update ~/srv/proxy on a host                   (3.3, 5)
 bin/project-add           workstation: deploy key, checkout, .env, compose up, on `proxy`     (4.4, 5)
 bin/site-add              workstation: cert, zone settings, site file, DNS, verify            (4.3, 4.5)
 bin/site-remove           workstation: site file off, optional DNS records removed            (5)
 bin/host-check            workstation: read-only server status                                (everywhere)
 bin/cf-zone               workstation: read-only Cloudflare zone status
-proxy/                    the files of /srv/proxy (compose.yaml, conf/Caddyfile, reload.sh, cloudflare.env ...)
+proxy/                    the files of ~/srv/proxy (compose.yaml, conf/Caddyfile, reload.sh, cloudflare.env ...)
 hosts/<name>.env          one per server (gitignored; hosts/example.env is the template)
 CLAUDE.local.md           your host table (gitignored)
 ```
@@ -271,7 +260,7 @@ can change firewalls can also delete servers.
 
 ## 8. Individual servers
 
-An individual server is the same recipe with one project: serverbeef, `host-bootstrap.sh`, `proxy-install`,
+An individual server is the same recipe with one project: serverbeef, `proxy-install`, `project-add`,
 `site-add`. Keeping the shared proxy even for one project means a second project can join later without touching
 the first, a project can move between shared and individual servers by changing DNS only, and every server is
 operated with the same commands. Mark it `TYPE=individual` in `hosts/<name>.env`. A project that needs something the

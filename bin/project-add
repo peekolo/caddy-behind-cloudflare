@@ -8,8 +8,8 @@
 # Steps:
 #   key       deploy's own read-only key for this repo on the box (~/.ssh/github-<project>, never leaves it) and
 #             a `Host github-<project>` ssh entry; prints the public key to add at GitHub (Settings > Deploy keys)
-#   checkout  git clone <repo> /srv/<project>, or git pull --ff-only
-#   env       --env FILE is copied to /srv/<project>/.env (mode 600, replaces what is there); without it, an
+#   checkout  git clone <repo> ~/srv/<project> (deploy's home), or git pull --ff-only
+#   env       --env FILE is copied to ~/srv/<project>/.env (mode 600, replaces what is there); without it, an
 #             existing .env is kept, or .env.example is copied and the empty keys are listed, values never printed.
 #             COMPOSE_FILE=<base>:<overlay> is added to .env so a plain `docker compose` uses the overlay
 #   check     `docker compose config` with the overlay: no host ports on any service, at least one service on
@@ -18,7 +18,7 @@
 #   verify    the project's containers are on `proxy` under the aliases listed in hosts/<host>.env
 #
 # Options: --branch <name>, --overlay <file> (default docker-compose.shared-host.yml), --no-build, --dry-run.
-# Root is never needed: host-bootstrap.sh gave deploy /srv, and the daemon is deploy's own rootless Docker.
+# Root is never needed: everything lives in deploy's home, and the daemon is deploy's own rootless Docker.
 source "$(dirname "$0")/../lib/common.sh"
 need ssh jq
 
@@ -40,7 +40,7 @@ done
 [[ "$OVERLAY" =~ ^[A-Za-z0-9_.-]+$ ]] || die "--overlay is a file name inside the checkout"
 load_host "$HOSTN"
 [[ "$DRY_RUN" == 1 ]] && warn "dry run: nothing will change"
-DIR=/srv/$PROJECT
+DIR=$SRV_DIR/$PROJECT             # relative to deploy's home, where every on_host command starts
 GH=github-$PROJECT                      # ssh host alias on the box, and the key file name under ~/.ssh
 KEY=.ssh/$GH                            # relative to deploy's home, where every on_host command starts
 HOST_PROJECTS=$(sed -nE 's/^PROJECTS=([^#]*).*/\1/p' "$AIDEPLOY/hosts/$HOSTN.env" | tr -d '"')
@@ -50,16 +50,10 @@ GITHUB_HOST_KEY='github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6
 
 step "preflight: $PROJECT on $HOST_NAME ($HOST_IP) as deploy"
 on_host "docker info --format '{{.SecurityOptions}}' 2>/dev/null" | grep -q rootless \
-  || die "deploy on $HOST_NAME has no rootless Docker daemon (serverbeef --docker, then bin/host-bootstrap.sh)"
+  || die "deploy on $HOST_NAME has no rootless Docker daemon (serverbeef with Docker, rootless, run by deploy)"
 on_host "docker network inspect $PROXY_NET >/dev/null 2>&1" || die "network $PROXY_NET missing (run bin/proxy-install $HOSTN first)"
-if on_host "test -d $DIR"; then
-  on_host "test -w $DIR" || die "$DIR exists but deploy cannot write it (re-run bin/host-bootstrap.sh)"
-  ok "$DIR exists"
-elif on_host "test -w /srv"; then
-  if act "mkdir $DIR"; then on_host "install -d -m 2775 $DIR"; ok "created $DIR"; fi
-else
-  die "deploy cannot create $DIR: re-run bin/host-bootstrap.sh (it hands /srv to deploy), or add --projects $PROJECT"
-fi
+if on_host "test -d $DIR"; then ok "$DIR exists in deploy's home"
+elif act "mkdir $DIR in deploy's home"; then on_host "install -d -m 755 $DIR"; ok "created $DIR"; fi
 grep -qw "$PROJECT" <<<"$HOST_PROJECTS" || warn "$PROJECT is not in PROJECTS= of hosts/$HOSTN.env: add it, and the host table row"
 if [[ -z "$REPO" ]]; then
   url=$(on_host "git -C $DIR remote get-url origin 2>/dev/null" || true)

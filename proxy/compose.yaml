@@ -1,4 +1,4 @@
-# The shared front door on a host that runs several projects (deploy/shared-host.md). Lives at /srv/proxy/.
+# The shared front door on a host that runs several projects. Lives at ~/srv/proxy/ in deploy's home.
 # It is the only container that publishes host ports. Projects join the external network `proxy` with a unique
 # alias and drop one site file into conf/sites/ (conf/Caddyfile imports sites/*.caddy).
 #
@@ -17,7 +17,7 @@
 # After ./cloudflare-ips.sh changed cloudflare.env:  docker compose up -d --wait caddy   (env is read at start)
 name: proxy
 
-x-logging: &journald            # age-limited by journald (14 days, host drop-in), not by Docker's size rotation
+x-logging: &journald            # age-limited by the host's journald retention, not by Docker's size rotation
   logging:
     driver: journald
     options:

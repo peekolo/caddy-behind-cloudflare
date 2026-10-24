@@ -59,7 +59,7 @@
 	}
 }
 
-# Access log to stdout -> journald (14 days at most). `client_ip` in each line is the visitor (CF-Connecting-IP).
+# Access log to stdout -> journald (the host's retention). `client_ip` in each line is the visitor (CF-Connecting-IP).
 # Query strings are cut (signed URLs carry their signature there). Cookie, Authorization and Set-Cookie values
 # are redacted by Caddy itself.
 (access_log) {

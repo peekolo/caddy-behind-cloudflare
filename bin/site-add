@@ -8,9 +8,9 @@
 #
 # Steps (default all; pick with --only cert,settings,site,dns,verify):
 #   cert      key + CSR made ON the box (the key never leaves it), Cloudflare Origin CA certificate (15 years,
-#             <zone> + *.<zone>) via the API, saved as /srv/proxy/certs/<zone>.pem; renewed when < 30 days left
+#             <zone> + *.<zone>) via the API, saved as ~/srv/proxy/certs/<zone>.pem (deploy's home); renewed when < 30 days left
 #   settings  zone: SSL Full (strict), Always Use HTTPS, minimum TLS 1.2, Rocket Loader off; --bot-fight off|on
-#   site      copies --site-file to /srv/proxy/conf/sites/<project>.caddy, validates + reloads; restores on failure
+#   site      copies --site-file to ~/srv/proxy/conf/sites/<project>.caddy, validates + reloads; restores on failure
 #   dns       A <name> -> host IP, proxied (orange), for each of --names; conflicting AAAA/CNAME: --replace
 #   verify    each name answers through Cloudflare (no 52x), and the origin refuses a direct connection
 #

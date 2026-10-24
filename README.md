@@ -70,20 +70,19 @@ from Cloudflare's IP ranges, so its real IP is never needed by visitors and is n
 
 ```
 visitor ─▶ Cloudflare ─▶ provider firewall (80/443 from Cloudflare only)
-        ─▶ Caddy in /srv/proxy (drops anything not from Cloudflare)
+        ─▶ Caddy in ~/srv/proxy, run by deploy (drops anything not from Cloudflare)
         ─▶ Docker network "proxy" ─▶ your project's container, by alias
 ```
 
 ### What the scripts do
 
-All of them run from your workstation over SSH, except `host-bootstrap.sh`. Each one checks the current state before
-changing anything, can be re-run, and takes `--dry-run`.
+All of them run from your workstation over SSH as the unprivileged `deploy` user; none needs root. Each one checks
+the current state before changing anything, can be re-run, and takes `--dry-run`.
 
 | Script | Does |
 |---|---|
-| `bin/host-bootstrap.sh` | Run once as root on a new server: journald retention of 14 days, an unprivileged `deploy` user, `/srv/*` folders |
-| `bin/proxy-install <host>` | Installs or updates the shared Caddy in `/srv/proxy` |
-| `bin/project-add <host> <project>` | Puts a project on a server as `deploy`: a read-only deploy key for its repo (made on the server, you add the public key at GitHub), the checkout in `/srv/<project>`, its `.env`, a check that the compose overlay publishes no ports and joins the proxy network, then `compose up`. Run again to deploy an update |
+| `bin/proxy-install <host>` | Installs or updates the shared Caddy in `~/srv/proxy` |
+| `bin/project-add <host> <project>` | Puts a project on a server as `deploy`: a read-only deploy key for its repo (made on the server, you add the public key at GitHub), the checkout in `~/srv/<project>`, its `.env`, a check that the compose overlay publishes no ports and joins the proxy network, then `compose up`. Run again to deploy an update |
 | `bin/site-add` | Puts a domain live: Cloudflare Origin CA certificate (key generated on the server), zone settings (Full strict SSL, HTTPS only, TLS 1.2+), the project's Caddy site file (validated, rolled back if Caddy rejects it), proxied DNS records, then checks that the site answers through Cloudflare and that the origin refuses direct connections |
 | `bin/site-remove` | Takes a site off a server, and optionally its DNS records |
 | `bin/host-check <host>` | Read-only server status: proxy health, drift from this repo, certificates, published ports, log retention |
@@ -117,8 +116,9 @@ changing anything, can be re-run, and takes `--dry-run`.
 ### Getting started (manual)
 
 1. Put your Cloudflare token in `cloudflare.token` (mode 600, gitignored), or export `CF_API_TOKEN`.
-2. Prepare the server (sections 3.1 to 3.3 of the runbook): provider firewall, hardening, then `host-bootstrap.sh`.
-3. Add SSH aliases for the admin and `deploy` users, copy `hosts/example.env` to `hosts/<name>.env` and fill it in.
+2. Prepare the server (sections 3.1 and 3.2 of the runbook): provider firewall, then serverbeef, which also writes
+   the `<name>` and `<name>_deploy` ssh aliases. Root is never needed after that.
+3. Copy `hosts/example.env` to `hosts/<name>.env` and fill it in.
 4. `bin/proxy-install <name>`, then `bin/host-check <name>`.
 5. For each project: add a compose overlay that joins the `proxy` network and a Caddy site file to the project's
    repo, run `bin/project-add <name> <project> --repo <owner>/<repo>`, then `bin/site-add` with `--dry-run` first

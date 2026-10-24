@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # site-remove: take one project's site off a host's shared Caddy, and optionally its DNS records.
 #   bin/site-remove --host myhost --project shop [--zone example.com --names "@ www"] [--dry-run]
-# The site file is kept in /srv/proxy/sites-backup/. DNS records are deleted only when --zone and --names are given
+# The site file is kept in ~/srv/proxy/sites-backup/ (deploy's home). DNS records are deleted only when --zone and --names are given
 # and only if they point at this host. The zone's certificate and settings stay (other names may use them).
 source "$(dirname "$0")/../lib/common.sh"
 need ssh curl jq
