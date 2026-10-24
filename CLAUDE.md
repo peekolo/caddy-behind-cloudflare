@@ -161,6 +161,13 @@ the registrar. The token covers every zone in the account, so nothing else is ne
   	}
   }
   ```
+- **A stack outside the repo root, or its own release command:** put `aideploy.env` at the repo root (KEY=value,
+  read as data, never sourced). `STACK_DIR=deploy/prod` (compose files, overlay and `.env` live there),
+  `OVERLAY=<file in that dir>`, `UP=deploy/prod/deploy.sh` (run from the checkout root instead of `compose up`; it
+  may build, migrate, smoke-test and roll back as it likes) and `RELEASE_VARS="TAG"` (variables `UP` sets itself,
+  given a placeholder for the config check). A `COMPOSE_FILE` already in `.env` is what the check uses. After `UP`,
+  project-add still checks the running containers: on `proxy`, no host ports. If `UP` smoke-tests through the proxy,
+  install the site file first (`site-add --only site`; a site that is not live yet cannot break).
 - A `.env.example` listing every variable the stack needs, secrets left empty. `bin/project-add` copies it to
   `.env` on the box and names the empty keys. Prefer images built in CI and pulled (`bin/project-add --no-build`);
   a build on a shared box can OOM its neighbours.
@@ -209,7 +216,7 @@ up in the app's own log with the visitor's address. `10.89.0.x` there means the 
 |---|---|
 | State of a server | `bin/host-check <host>` |
 | State of a zone | `bin/cf-zone <zone>` |
-| Deploy a project update | `bin/project-add <host> <project>` (git pull --ff-only, compose up -d --build) |
+| Deploy a project update | `bin/project-add <host> <project>` (git pull --ff-only, then compose up -d --build or the project's `UP`) |
 | Change a project's site file | edit it in the project repo, then `bin/site-add ... --only site,verify` |
 | Change the proxy itself (Caddyfile, snippets, compose) | edit `proxy/` here, `bin/proxy-install <host>` on **every** host in section 2 |
 | Cloudflare changed its IP ranges | `proxy/cloudflare-ips.sh` (writes `proxy/cloudflare.env`), then `bin/proxy-install <host>` per host; update the firewall group if it lists ranges by hand |
